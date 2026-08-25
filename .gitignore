@@ -47,3 +47,6 @@ previous/
 
 # Logs
 *.log
+
+# Local authentication material
+.executor-auth-header
