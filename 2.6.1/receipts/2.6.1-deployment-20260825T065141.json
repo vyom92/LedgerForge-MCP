@@ -1,0 +1,9 @@
+{
+  "backup_dir": "/Users/vyom/ledgerforge-mcp-prototype/mcp2.6.1-backups/2.6.0-20260825T065131",
+  "credential_values_exposed": false,
+  "release": "2.6.1",
+  "rollback_performed": false,
+  "status": "PASS",
+  "target_launcher_sha256": "969d20ff5cb43cbb3678806324cfd4561f81b346f03553c8988c776a9c9c8c3b",
+  "target_source_sha256": "48666ab8560f3d365a48970a7792814f137916fd861d857dbfa4fe4ff635d292"
+}

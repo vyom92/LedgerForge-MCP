@@ -1,0 +1,49 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Executor credentials / identity
+.executor-token
+.executor-admin-token
+.executor-path
+.executor-version
+.executor-v2.1-features.json
+.executor-v2.1-state-root
+.executor-live.log
+
+# Executor runtime state
+.executor-runs/
+.executor-runs-*/
+.executor-task-workspaces/
+
+# MCP local control plane
+.mcp-maintenance/
+.mcp-path
+.mcp-release-version
+.mcp-owner-recovery-version
+.mcp-owner-recovery.lock
+
+# Historical compatibility paths / machine-local stores
+mcp-releases
+mcp2.1-backups
+mcp2.3-backups
+mcp2.4-backups
+mcp2.5-backups
+mcp2.5.1-backups
+mcp2.5.2-backups
+mcp2.6-backups
+mcp2.6.1-backups
+mcp-owner-recovery-audit
+mcp-owner-recovery-backups
+mcp-owner-recovery-deployment-backups
+
+# Local historical material
+archive/
+previous/
+
+# Logs
+*.log
