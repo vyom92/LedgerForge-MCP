@@ -30,9 +30,10 @@ def tools(tree):
     return out
 
 source=Path(sys.argv[1]).resolve(); data=source.read_bytes(); text=data.decode("utf-8"); tree=ast.parse(text,filename=str(source))
-assert literal(tree,"EXECUTOR_VERSION")=="2.6.1"
-assert literal(tree,"TOOLSET_REVISION")==8
-assert literal(tree,"SCHEMA_CONTRACT_REVISION")=="2.6.1"
+assert any(isinstance(n,ast.Import) and any(a.name=="sys" for a in n.names) for n in tree.body), "missing top-level import sys"
+assert literal(tree,"EXECUTOR_VERSION")=="2.6.2"
+assert literal(tree,"TOOLSET_REVISION")==9
+assert literal(tree,"SCHEMA_CONTRACT_REVISION")=="2.6.2"
 assert tools(tree)==EXPECTED,(sorted(EXPECTED-tools(tree)),sorted(tools(tree)-EXPECTED))
 contract=literal(tree,"TOOL_ANNOTATION_CONTRACT")
 assert set(contract)==EXPECTED
@@ -53,9 +54,10 @@ assert 'task-workspaces' in text
 assert 'reviewed-local-process' in text
 assert 'binary_metadata' in text
 assert 'deleted binary file sha256' not in text
-assert 'repository-with-lease-excluding-dotgit' in text
+assert 'repository-with-lease-effect-bounded-excluding-dotgit' in text
 assert 'snapshot-copied into task workspace' in text
 assert 'deny file-read* (subpath' in text
+assert '(allow file-read-metadata)' in text
 assert 'deny file-write* (subpath' in text and '.git' in text
 assert 'local-process' in text
 assert 'cwd_root' in text and '${input:' in text
@@ -81,7 +83,7 @@ assert 'payload: list[str] = [f"HEAD={resolve_ref(\'HEAD\')}", git_worktree_stat
 assert 'ending_worktree_fingerprint != state.get("starting_worktree_fingerprint")' in text
 assert 'ending_index_fingerprint != state.get("starting_index_fingerprint")' in text
 
-# 2.6.1 lifecycle/admin maintenance invariants.
+# 2.6.2 lifecycle/admin maintenance and hardening invariants.
 assert 'Literal["create", "status", "cleanup", "close"]' in text
 assert 'def validation_wait_result(' in text and 'result_ready' in text and 'retry_safe' in text
 assert 'selector_capabilities' in text and 'zero_test_result_is_acceptance' in text
@@ -97,7 +99,7 @@ assert '"history_truncated": len(terminal_processes) > len(presented_terminal_pr
 assert '"cleanup_safe": not running_processes and active_validation is None' in text
 assert 'WORKTREE_FINGERPRINT_REVISION = "2"' in text
 assert 'INDEX_FINGERPRINT_REVISION = "1"' in text
-assert 'MaintenanceReleaseAction = Literal["stage", "qualify", "status", "arm", "discard"]' in text
+assert 'MaintenanceReleaseAction = Literal["stage", "qualify", "status", "arm", "discard", "upload_chunk", "finalize_blob"]' in text
 assert 'ledgerforge:admin' in text and 'def require_admin_scope()' in text
 assert 'scopes=["ledgerforge:execute"]' in text
 assert 'scopes=["ledgerforge:execute", "ledgerforge:admin"]' in text
@@ -117,14 +119,39 @@ assert 'venv = Path(sys.prefix).resolve()' in text
 assert 'Raw maintenance log bytes are not exposed; use read_text for credential-redacted diagnostics.' in text
 assert '(allow network-bind (local ip "localhost:*"))' in text
 assert '(allow network-outbound (remote ip "localhost:*"))' in text
+assert 'MAX_VALIDATION_STATUS_WAIT_SECONDS = 300' in text
+assert 'GENERIC_FS_PLAN_VERSION = "local-fs-reviewed-plan-v2"' in text
+assert 'PROCESS_PLAN_VERSION = "local-process-reviewed-plan-v2"' in text
+assert 'TASK_WORKSPACE_TAINT_MARKER = ".mcp-private-source-taint.json"' in text
+assert 'mcp_private_source_taint_v1' in text
+assert 'Private-original-derived data may not be copied into the product repository.' in text
+assert 'Private-original-derived task workspaces or inputs may not receive repository process write scope.' in text
+assert 'expected_changed_paths' in text and 'max_changed_path_count' in text
+assert 'repository_effects_verified' in text and 'repository_unexpected_effect_paths' in text
+assert 'changed_path_count_exceeded' in text and 'unexpected_changed_path' in text
+assert 'private-source-taint-enforcement' in text
+assert 'repository-process-effect-bounds' in text
+assert 'extended-durable-waits' in text
+assert 'MAINTENANCE_MAX_BLOB_CHUNK_BYTES = 512 * 1024' in text
+assert 'MAINTENANCE_BLOB_ID_PATTERN' in text
+assert 'def _maintenance_upload_blob_chunk(' in text
+assert 'def _maintenance_finalize_blob(' in text
+assert 'def _maintenance_blob_payload(' in text
+assert 'immutable_chunk' in text and 'immutable_blob' in text
+assert 'arbitrary_caller_paths' in text and 'whole_file_sha256_required' in text
+assert 'finalize_blob requires blob_ref' in text
+assert 'components[{index}] requires content_base64 or finalized blob_ref.' in text
 
 compile(text,str(source),"exec")
-print("MCP 2.6.1 STATIC QUALIFICATION: PASS")
+print("MCP 2.6.2 STATIC QUALIFICATION: PASS")
 print("source_sha256="+hashlib.sha256(data).hexdigest())
 print("tool_count=55")
 print("binary_filesystem_contract=PASS")
 print("task_workspace_contract=PASS")
 print("reviewed_process_contract=PASS")
+print("private_source_taint_contract=PASS")
+print("repository_process_effect_bounds_contract=PASS")
+print("extended_wait_contract=PASS")
 print("same_owner_evidence_contract=PASS")
 print("secret_reference_contract=PASS")
 

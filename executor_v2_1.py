@@ -16,6 +16,7 @@ import signal
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -48,9 +49,9 @@ except Exception:  # compatibility with older MCP SDKs
 # Configuration
 # ==========================================================================
 
-EXECUTOR_VERSION = "2.6.1"
-TOOLSET_REVISION = 8
-SCHEMA_CONTRACT_REVISION = "2.6.1"
+EXECUTOR_VERSION = "2.6.2"
+TOOLSET_REVISION = 9
+SCHEMA_CONTRACT_REVISION = "2.6.2"
 DEFAULT_REPO = Path("/Users/vyom/Applications/LedgerForge").resolve()
 REPO_ROOT_ENV = "LEDGERFORGE_EXECUTOR_REPO_ROOT"
 EXPECTED_REMOTE_URL_ENV = "LEDGERFORGE_EXECUTOR_EXPECTED_REMOTE_URL"
@@ -114,7 +115,7 @@ MAX_LEASE_SECONDS = 14_400
 DEFAULT_LEASE_SECONDS = 7_200
 MAX_LOG_SECONDS = 900
 MAX_LOG_LINES = 500
-MAX_VALIDATION_STATUS_WAIT_SECONDS = 60
+MAX_VALIDATION_STATUS_WAIT_SECONDS = 300
 MAX_PROVENANCE_LABEL_CHARS = 120
 MAX_PRIVATE_STRUCTURED_RESULT_BYTES = 64 * 1024
 PRIVATE_RESULT_FILE_ENV = "LEDGERFORGE_PRIVATE_RESULT_FILE"
@@ -122,6 +123,7 @@ PRIVATE_RESULT_DOWNLOADS_PREFIX = ".ledgerforge-executor-private-result-"
 PRIVATE_RESULT_MARKER_NAME = ".ledgerforge-executor-private-result"
 TASK_WORKSPACE_ROOT = (BRIDGE_ROOT / ".executor-task-workspaces").resolve()
 TASK_WORKSPACE_MARKER = ".mcp-task-workspace.json"
+TASK_WORKSPACE_TAINT_MARKER = ".mcp-private-source-taint.json"
 LOCAL_PROCESS_STATES = RUNS / "local-processes"
 LOCAL_PROCESS_OUTPUT = RUNS / "local-process-output"
 SECRET_REF_FILE = BRIDGE_ROOT / ".executor-secret-refs.json"
@@ -133,9 +135,14 @@ MAINTENANCE_RELEASE_STATE = "release-state.json"
 MAINTENANCE_QUALIFICATION_RESULT = "qualification-result.json"
 MAINTENANCE_QUALIFICATION_EXIT = "qualification-exit.json"
 MAINTENANCE_MAX_COMPONENT_BYTES = 6 * 1024 * 1024
+MAINTENANCE_MAX_BLOB_CHUNK_BYTES = 512 * 1024
+MAINTENANCE_BLOB_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{2,119}$"
+MAINTENANCE_BLOB_MANIFEST = "blob-manifest.json"
+MAINTENANCE_BLOB_FILE = "blob.bin"
 MAINTENANCE_RELEASE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{2,119}$"
-GENERIC_FS_PLAN_VERSION = "local-fs-reviewed-plan-v1"
-PROCESS_PLAN_VERSION = "local-process-reviewed-plan-v1"
+GENERIC_FS_PLAN_VERSION = "local-fs-reviewed-plan-v2"
+PROCESS_PLAN_VERSION = "local-process-reviewed-plan-v2"
+MAX_REPOSITORY_PROCESS_CHANGED_PATHS = 200
 MAX_GENERIC_FILE_BYTES = 8 * 1024 * 1024
 MAX_GENERIC_READ_BYTES = 96 * 1024
 MAX_GENERIC_PROCESS_SECONDS = 3600
@@ -159,7 +166,7 @@ PrivateResultContract = Literal["structural_evidence_v1"]
 ValidationResultDetail = Literal["summary", "failures", "diagnostics", "private_result"]
 MaintenanceInspectTarget = Literal["executor_source", "main_launcher", "owner_admin", "owner_wrapper", "owner_version", "static_qualifier", "isolated_qualifier", "release_activator", "release_version", "state_root_pointer", "executor_log", "tunnel_log"]
 MaintenanceInspectAction = Literal["stat", "hash", "read_bytes", "read_text"]
-MaintenanceReleaseAction = Literal["stage", "qualify", "status", "arm", "discard"]
+MaintenanceReleaseAction = Literal["stage", "qualify", "status", "arm", "discard", "upload_chunk", "finalize_blob"]
 RootId = Literal["repo", "originals", "derived_data", "executor_artifacts", "ledgerforge_logs", "task_scratch"]
 ArtifactKind = Literal["auto", "metadata", "json", "plist", "xcresult", "sqlite"]
 GitInspectMode = Literal["state", "diff", "staged-diff", "log", "show", "blame"]
@@ -240,7 +247,8 @@ for _directory in (OPERATIONS, LEASES, JOURNALS, PROCESS_RECORDS, EVIDENCE, LOCA
 os.chmod(RUNS, 0o700)
 TASK_WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 os.chmod(TASK_WORKSPACE_ROOT, 0o700)
-for _directory in (MAINTENANCE_ROOT, PREPARED_RELEASE_ROOT, MAINTENANCE_OPERATIONS):
+MAINTENANCE_BLOB_ROOT = MAINTENANCE_ROOT / "blobs"
+for _directory in (MAINTENANCE_ROOT, PREPARED_RELEASE_ROOT, MAINTENANCE_OPERATIONS, MAINTENANCE_BLOB_ROOT):
     _directory.mkdir(parents=True, exist_ok=True)
     os.chmod(_directory, 0o700)
 EXECUTOR_BOOT_ID = str(uuid.uuid4())
@@ -436,6 +444,10 @@ CORE_FEATURES = {
     "executor-help",
     "admin-maintenance",
     "durable-release-handoff",
+    "durable-release-blob-ingestion",
+    "private-source-taint-enforcement",
+    "repository-process-effect-bounds",
+    "extended-durable-waits",
 }
 
 EVIDENCE_FEATURES = {
@@ -2505,6 +2517,35 @@ def require_task_workspace(workspace_id: str) -> Path:
         raise RuntimeError("Task workspace marker identity mismatch.")
     return root
 
+def task_workspace_taint_marker(workspace_id: str) -> Path:
+    return task_workspace_path(workspace_id) / TASK_WORKSPACE_TAINT_MARKER
+
+def _task_workspace_is_tainted(workspace_id: str) -> bool:
+    marker = task_workspace_taint_marker(workspace_id)
+    if not marker.is_file() or marker.is_symlink():
+        return False
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Task workspace taint marker is unreadable: {workspace_id}") from exc
+    if data.get("kind") != "mcp_private_source_taint_v1" or data.get("workspace_id") != workspace_id or data.get("tainted") is not True:
+        raise RuntimeError(f"Task workspace taint marker identity mismatch: {workspace_id}")
+    return True
+
+def _mark_task_workspace_tainted(workspace_id: str, source_class: str) -> None:
+    require_task_workspace(workspace_id)
+    marker = task_workspace_taint_marker(workspace_id)
+    if _task_workspace_is_tainted(workspace_id):
+        return
+    atomic_write_json(marker, {
+        "kind": "mcp_private_source_taint_v1",
+        "workspace_id": workspace_id,
+        "tainted": True,
+        "source_class": source_class,
+        "marked_at": now_iso(),
+        "executor_version": EXECUTOR_VERSION,
+    })
+
 def _task_workspace_for_relative(relative: str) -> tuple[str, Path]:
     parts = Path(relative).parts
     if not parts:
@@ -2555,8 +2596,8 @@ def _normalize_local_mutation_target(root_id: str, path: str, *, allow_root: boo
         candidate.relative_to(workspace_root)
     except ValueError as exc:
         raise PermissionError("Task mutation escapes its owning workspace.") from exc
-    if candidate == task_workspace_marker(workspace_id):
-        raise PermissionError("Task workspace ownership marker may only be changed by task_workspace.")
+    if candidate in {task_workspace_marker(workspace_id), task_workspace_taint_marker(workspace_id)}:
+        raise PermissionError("Task workspace ownership/taint markers may only be changed by executor lifecycle controls.")
     return relative, candidate, root, workspace_id
 
 def _local_file_metadata(root_id: str, relative: str, candidate: Path) -> dict[str, Any]:
@@ -2704,6 +2745,14 @@ def _local_fs_preflight(operations: list[dict[str, Any]]) -> tuple[str, list[tup
                 raise ValueError(f"{relative}: copy requires source_path.")
             source_relative, source, source_root = _strict_generic_root_path(source_root_id, source_path, allow_final_symlink=False)
             source_check = _validate_expected_file(item, source_relative, source)
+            source_tainted = source_root_id == "originals"
+            if source_root_id == "task_scratch":
+                source_workspace_id, _ = _task_workspace_for_relative(source_relative)
+                source_tainted = _task_workspace_is_tainted(source_workspace_id)
+            if root_id == "repo" and source_tainted:
+                raise PermissionError("Private-original-derived data may not be copied into the product repository.")
+            if root_id == "task_scratch" and source_tainted:
+                item["_taint_destination_workspace"] = workspace_id
             item["source_root_id"] = source_root_id
             item["source_path"] = source_relative
             item["_source_candidate"] = source
@@ -2841,6 +2890,9 @@ def _apply_local_fs_operations(root_id: str, normalized: list[tuple[str, dict[st
             raise RuntimeError(f"{after_path}: target still exists after reviewed deletion.")
         elif kind == "mkdir" and (after.get("type") != "directory" or after.get("empty") is not True):
             raise RuntimeError(f"{after_path}: resulting directory differs from reviewed metadata.")
+        taint_workspace = item.get("_taint_destination_workspace")
+        if taint_workspace:
+            _mark_task_workspace_tainted(str(taint_workspace), "private-original-derived-copy")
         results.append({"op": kind, "root_id": root_id, "path": item["path"], "before": before, "after": after, **({"destination": item["destination"]} if kind == "move" else {})})
     return results
 
@@ -3090,6 +3142,64 @@ def _sha256_file_stream(candidate: Path) -> tuple[str, int]:
             digest.update(chunk)
     return digest.hexdigest(), size
 
+def _repository_changed_path_identities() -> dict[str, str]:
+    changed = sorted(set(changed_tracked_paths()) | set(untracked_paths()) | set(conflicted_paths()))
+    return {relative: current_path_identity(relative) for relative in changed}
+
+def _repository_process_effect_verdict(
+    starting_map: dict[str, str],
+    ending_map: dict[str, str],
+    expected_changed_paths: list[str],
+    max_changed_path_count: int,
+    starting_head: str | None,
+    ending_head: str | None,
+    starting_index_fingerprint: str | None,
+    ending_index_fingerprint: str | None,
+) -> dict[str, Any]:
+    effect_paths = sorted(path for path in set(starting_map) | set(ending_map) if starting_map.get(path, "ABSENT_FROM_CHANGED_SET") != ending_map.get(path, "ABSENT_FROM_CHANGED_SET"))
+    expected_effects = set(expected_changed_paths)
+    unexpected_effects = sorted(set(effect_paths) - expected_effects)
+    violations: list[str] = []
+    if unexpected_effects:
+        violations.append("unexpected_changed_path")
+    if len(effect_paths) > max_changed_path_count:
+        violations.append("changed_path_count_exceeded")
+    if ending_head != starting_head:
+        violations.append("head_changed")
+    if ending_index_fingerprint != starting_index_fingerprint:
+        violations.append("index_changed")
+    return {
+        "repository_effect_paths": effect_paths,
+        "repository_unexpected_effect_paths": unexpected_effects,
+        "repository_effect_violations": violations,
+        "repository_effects_verified": not violations,
+    }
+
+def _normalize_repository_process_effect_bounds(execution_class: str, expected_changed_paths: list[str] | None, max_changed_path_count: int | None) -> tuple[list[str], int]:
+    if execution_class != "repository":
+        if expected_changed_paths is not None or max_changed_path_count is not None:
+            raise ValueError("Repository effect bounds are only valid for execution_class=repository.")
+        return [], 0
+    if not isinstance(expected_changed_paths, list) or not expected_changed_paths:
+        raise ValueError("Repository process execution requires a non-empty expected_changed_paths allowlist.")
+    if len(expected_changed_paths) > MAX_REPOSITORY_PROCESS_CHANGED_PATHS:
+        raise ValueError(f"expected_changed_paths accepts at most {MAX_REPOSITORY_PROCESS_CHANGED_PATHS} paths.")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in expected_changed_paths:
+        if not isinstance(raw, str) or not raw:
+            raise ValueError("expected_changed_paths entries must be non-empty strings.")
+        relative, _ = normalize_repo_write_path(raw)
+        if relative in seen:
+            raise ValueError("expected_changed_paths entries must be unique.")
+        seen.add(relative)
+        normalized.append(relative)
+    normalized.sort()
+    limit = len(normalized) if max_changed_path_count is None else max_changed_path_count
+    if not isinstance(limit, int) or limit < 0 or limit > len(normalized):
+        raise ValueError("max_changed_path_count must be between 0 and the expected_changed_paths count.")
+    return normalized, limit
+
 def _process_plan(
     *,
     workspace_id: str,
@@ -3100,6 +3210,8 @@ def _process_plan(
     env_additions: dict[str, str],
     stdin_descriptor: dict[str, Any],
     input_files: list[dict[str, Any]],
+    expected_changed_paths: list[str] | None,
+    max_changed_path_count: int | None,
     timeout_seconds: int,
     expected_exit_codes: list[int],
     output_paths: list[str],
@@ -3168,14 +3280,24 @@ def _process_plan(
             raise RuntimeError(f"Process input SHA changed: {root_id}:{relative}")
         if expected_size is not None and expected_size != actual_size:
             raise RuntimeError(f"Process input size changed: {root_id}:{relative}")
+        input_tainted = root_id == "originals"
+        if root_id == "task_scratch":
+            source_workspace_id, _ = _task_workspace_for_relative(relative)
+            input_tainted = _task_workspace_is_tainted(source_workspace_id)
         normalized_inputs.append({
             "root_id": root_id,
             "path": relative,
             "resolved_path": str(candidate),
             "sha256": actual_sha,
             "size": actual_size,
+            "private_source_tainted": input_tainted,
             "materialized_path": _materialized_input_path(workspace, index, candidate.name).relative_to(workspace).as_posix(),
         })
+    workspace_tainted = _task_workspace_is_tainted(workspace_id)
+    private_input_tainted = any(bool(row.get("private_source_tainted")) for row in normalized_inputs)
+    if execution_class == "repository" and (workspace_tainted or private_input_tainted):
+        raise PermissionError("Private-original-derived task workspaces or inputs may not receive repository process write scope.")
+    normalized_expected_changes, changed_path_limit = _normalize_repository_process_effect_bounds(execution_class, expected_changed_paths, max_changed_path_count)
     canonical = {
         "version": PROCESS_PLAN_VERSION,
         "workspace_id": workspace_id,
@@ -3189,6 +3311,11 @@ def _process_plan(
         "env_additions": env_additions,
         "stdin": stdin_descriptor,
         "input_files": normalized_inputs,
+        "workspace_private_source_tainted": workspace_tainted,
+        "private_source_tainted": workspace_tainted or private_input_tainted,
+        "would_taint_workspace": execution_class == "scratch" and private_input_tainted,
+        "expected_changed_paths": normalized_expected_changes,
+        "max_changed_path_count": changed_path_limit,
         "timeout_seconds": timeout_seconds,
         "expected_exit_codes": expected_exit_codes,
         "output_paths": normalized_outputs,
@@ -3292,12 +3419,24 @@ def _local_process_worker(run_id: str, command: list[str], environment: dict[str
                     or ending_worktree != state.get("starting_worktree_fingerprint")
                     or ending_index != state.get("starting_index_fingerprint")
                 )
+                starting_map = state.get("starting_changed_path_identities") or {}
+                ending_map = _repository_changed_path_identities()
+                verdict = _repository_process_effect_verdict(
+                    starting_map, ending_map, list(state.get("expected_changed_paths") or []), int(state.get("max_changed_path_count") or 0),
+                    state.get("starting_head"), ending_head, state.get("starting_index_fingerprint"), ending_index,
+                )
+                state.update(verdict)
+                if verdict["repository_effect_violations"]:
+                    classification = "repository_effect_violation"
                 if state["repository_mutated"] and state.get("lease_id"):
                     lease = read_active_lease_raw()
                     if lease and lease.get("status") == "active" and lease.get("lease_id") == state.get("lease_id"):
                         invalidate_lease_validation_binding(lease, "generic repository process changed repository state")
             except Exception as repo_exc:
                 state["repository_evidence_error"] = sanitize_text(str(repo_exc), secret_values)[:1000]
+                state["repository_effects_verified"] = False
+                state["repository_effect_violations"] = ["effect_evidence_failure"]
+                classification = "repository_effect_evidence_failure"
         state.update({
             "status": final_status,
             "classification": classification,
@@ -3496,8 +3635,23 @@ def executor_capabilities() -> dict[str, Any]:
         "task_workspace_lifecycle": ["create", "status", "cleanup", "close"],
         "generic_process_lifecycle": ["review", "start", "status", "wait", "cancel", "result"],
         "generic_process_network_policy": "deny",
-        "generic_process_write_scopes": ["task-workspace", "repository-with-lease-excluding-dotgit"],
-        "generic_process_input_semantics": "exact registered-root source digest rechecked then snapshot-copied into task workspace; subprocess receives ${input:N}",
+        "generic_process_write_scopes": ["task-workspace", "repository-with-lease-effect-bounded-excluding-dotgit"],
+        "generic_process_input_semantics": "exact registered-root source digest rechecked then snapshot-copied into task workspace; private-original-derived inputs taint scratch and cannot receive repository write scope; declared inputs become verified workspace-local paths",
+        "private_source_taint_policy": {
+            "marker_contract": "mcp_private_source_taint_v1",
+            "direct_originals_to_repo_copy": "denied",
+            "tainted_scratch_to_repo_copy": "denied",
+            "tainted_repository_process": "denied",
+            "semantic_llm_declassification": "outside-executor-information-flow-boundary",
+        },
+        "repository_process_effect_policy": {
+            "expected_changed_paths_required": True,
+            "maximum_allowlist_paths": MAX_REPOSITORY_PROCESS_CHANGED_PATHS,
+            "preexisting_dirty_path_identity_compared": True,
+            "head_change_allowed": False,
+            "index_change_allowed": False,
+            "automatic_rollback": False,
+        },
         "registered_secret_refs": sorted(registered_secret_refs()),
         "owner_break_glass_command": str(Path.home() / "Desktop" / "LedgerForge MCP Owner Recovery.command"),
         "git_operations": ["inspect", "fetch-origin", "stage-exact", "commit-staged", "push-origin-main"],
@@ -3523,6 +3677,15 @@ def executor_capabilities() -> dict[str, Any]:
         "validation_wait_result_durable": True,
         "fingerprint_contract": {"worktree_revision": WORKTREE_FINGERPRINT_REVISION, "worktree_semantics": WORKTREE_FINGERPRINT_SEMANTICS, "index_revision": INDEX_FINGERPRINT_REVISION, "index_semantics": INDEX_FINGERPRINT_SEMANTICS},
         "admin_maintenance": {"configured": bool(ADMIN_BEARER_TOKEN), "scope": "ledgerforge:admin", "normal_token_has_admin_scope": False, "prepared_release_state_durable_across_chats": True, "qualification_network_policy": "loopback-only"},
+        "release_transport": {
+            "inline_content_base64": "supported-for-small-components",
+            "immutable_blob_chunks": "supported",
+            "chunk_size_limit": MAINTENANCE_MAX_BLOB_CHUNK_BYTES,
+            "component_size_limit": MAINTENANCE_MAX_COMPONENT_BYTES,
+            "whole_file_sha256_required": True,
+            "cross_chat_resume": True,
+            "arbitrary_caller_paths": False,
+        },
         "ci_status_inspection_enabled": feature_enabled("optional", "ci-status-inspection"),
         "unsupported": [
             "unreviewed process execution", "network/browser automation", "git reset", "git restore", "git clean",
@@ -3550,9 +3713,9 @@ def executor_help(topic: Literal["overview", "reads", "mutation", "validation", 
         "reads": ["Use evidence_batch for a stable grouped read.", "Use local_fs_inspect for binary-safe registered-root stat/hash/range reads."],
         "mutation": ["Never reuse stale fingerprints.", "Repository writes require lease + exact HEAD/worktree/index.", "Generic Git metadata writes remain forbidden."],
         "validation": ["test-focused/test-full fail closed on zero tests.", "test_discovery reports conservative selector capability metadata.", "validation_wait_result combines bounded wait and retained result retrieval."],
-        "process": ["process_start is reviewed argv execution with network denied.", "Use task workspaces; declared external inputs are snapshot-copied.", "process state/results survive client disconnect."],
+        "process": ["process_start is reviewed argv execution with network denied.", "Use task workspaces; declared external inputs are snapshot-copied.", "Private-original-derived inputs taint scratch and cannot receive repository write scope.", "Repository-class processes require an expected changed-path allowlist and bounded effect count.", "process state/results survive client disconnect."],
         "recovery": ["execution_snapshot groups lease, validation, processes, workspaces and cleanup safety.", "Owner Recovery remains local break-glass and independent of ChatGPT."],
-        "maintenance": ["Maintenance tools require ledgerforge:admin.", "They can inspect allowlisted MCP control files and stage/qualify/arm immutable releases.", "They cannot expose arbitrary home files, Keychain secrets or a generic admin shell.", "Prepared release state is durable and resumable from a fresh admin chat."],
+        "maintenance": ["Maintenance tools require ledgerforge:admin.", "They can inspect allowlisted MCP control files and stage/qualify/arm immutable releases.", "Large components use resumable immutable blob chunks with per-chunk and whole-file SHA-256 verification; arbitrary caller paths are never read.", "They cannot expose arbitrary home files, Keychain secrets or a generic admin shell.", "Prepared release state is durable and resumable from a fresh admin chat."],
     }
     return {"executor_version": EXECUTOR_VERSION, "toolset_revision": TOOLSET_REVISION, "topic": topic, "quick_rules": common, "usage": topics[topic]}
 
@@ -4624,7 +4787,7 @@ def task_workspace(
                 return finish_operation(operation_id, {"workspace_id": workspace_id, "exists": False, "resolved_path": str(root)})
             require_task_workspace(workspace_id)
             entries = sum(1 for _ in root.rglob("*"))
-            return finish_operation(operation_id, {"workspace_id": workspace_id, "exists": True, "resolved_path": str(root), "entry_count": entries})
+            return finish_operation(operation_id, {"workspace_id": workspace_id, "exists": True, "resolved_path": str(root), "entry_count": entries, "private_source_tainted": _task_workspace_is_tainted(workspace_id)})
         if action == "create":
             if root.exists():
                 raise FileExistsError(f"Task workspace already exists: {workspace_id}")
@@ -4713,6 +4876,8 @@ def process_start(
     stdin_path: str | None = None,
     stdin_secret_ref: str | None = None,
     input_files: list[dict[str, Any]] = [],
+    expected_changed_paths: list[str] | None = None,
+    max_changed_path_count: Annotated[int, Field(ge=0, le=MAX_REPOSITORY_PROCESS_CHANGED_PATHS)] | None = None,
     timeout_seconds: Annotated[int, Field(ge=1, le=MAX_GENERIC_PROCESS_SECONDS)] = 300,
     expected_exit_codes: list[int] = [0],
     output_paths: list[str] = [],
@@ -4738,6 +4903,8 @@ def process_start(
         env_additions=env_clean,
         stdin_descriptor=stdin_descriptor,
         input_files=input_files,
+        expected_changed_paths=expected_changed_paths,
+        max_changed_path_count=max_changed_path_count,
         timeout_seconds=timeout_seconds,
         expected_exit_codes=expected_exit_codes,
         output_paths=output_paths,
@@ -4780,6 +4947,8 @@ def process_start(
         executable_sha_now, executable_size_now = _sha256_file_stream(executable_now)
         if executable_sha_now != plan["executable_sha256"] or executable_size_now != plan["executable_size"]:
             raise RuntimeError("Executable changed after reviewed process plan.")
+        if execution_class == "scratch" and plan.get("would_taint_workspace"):
+            _mark_task_workspace_tainted(workspace_id, "private-original-derived-process-input")
         input_replacements = _materialize_process_inputs(workspace_id, plan["input_files"])
         profile_path = workspace / f".mcp-sandbox-{uuid.uuid4().hex}.sb"
         profile_path.write_text(_sandbox_profile(workspace, execution_class), encoding="utf-8")
@@ -4808,6 +4977,8 @@ def process_start(
             "executable_size": plan["executable_size"],
             "argv": argv,
             "input_files": plan["input_files"],
+            "expected_changed_paths": plan["expected_changed_paths"],
+            "max_changed_path_count": plan["max_changed_path_count"],
             "cwd_root": plan["cwd_root"],
             "cwd_path": plan["cwd_path"],
             "env_keys": sorted(env_clean),
@@ -4829,6 +5000,11 @@ def process_start(
             "starting_head": resolve_ref("HEAD") if execution_class == "repository" else None,
             "starting_worktree_fingerprint": worktree_fingerprint() if execution_class == "repository" else None,
             "starting_index_fingerprint": index_fingerprint() if execution_class == "repository" else None,
+            "starting_changed_path_identities": _repository_changed_path_identities() if execution_class == "repository" else None,
+            "repository_effects_verified": None,
+            "repository_effect_paths": [],
+            "repository_unexpected_effect_paths": [],
+            "repository_effect_violations": [],
             "ending_head": None,
             "ending_worktree_fingerprint": None,
             "ending_index_fingerprint": None,
@@ -4853,11 +5029,11 @@ def process_status(run_id: UUIDString) -> dict[str, Any]:
     state = _read_local_process_state(run_id)
     return {k: state.get(k) for k in (
         "run_id", "operation_id", "workspace_id", "lease_id", "execution_id", "execution_class",
-        "status", "classification", "resolved_executable", "executable_sha256", "executable_size", "argv", "input_files", "cwd_root", "cwd_path", "env_keys", "secret_refs",
+        "status", "classification", "resolved_executable", "executable_sha256", "executable_size", "argv", "input_files", "expected_changed_paths", "max_changed_path_count", "cwd_root", "cwd_path", "env_keys", "secret_refs",
         "timeout_seconds", "expected_exit_codes", "output_paths", "network_policy", "write_scope",
         "process_plan_digest", "reviewed_plan_digest_verified", "started_at", "completed_at",
         "duration_seconds", "pid", "pgid", "exit_code", "signal", "starting_head", "starting_worktree_fingerprint", "starting_index_fingerprint",
-        "ending_head", "ending_worktree_fingerprint", "ending_index_fingerprint", "repository_mutated", "repository_evidence_error", "error_type", "error_message",
+        "ending_head", "ending_worktree_fingerprint", "ending_index_fingerprint", "repository_mutated", "repository_effects_verified", "repository_effect_paths", "repository_unexpected_effect_paths", "repository_effect_violations", "repository_evidence_error", "error_type", "error_message",
     )}
 
 @tool(read_only=True, destructive=False, idempotent=False)
@@ -6790,7 +6966,7 @@ def ci_status_inspection() -> dict[str, Any]:
 
 
 # ==========================================================================
-# MCP 2.6.1 admin maintenance control plane
+# MCP 2.6.2 admin maintenance control plane
 # ==========================================================================
 
 _MAINTENANCE_COMPONENT_FILES = {
@@ -6879,7 +7055,229 @@ def _maintenance_release_identity_digest(state: dict[str, Any]) -> str:
     return sha256_text(json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 
 
-def _maintenance_component_payload(components: list[dict[str, Any]] | None) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
+def _maintenance_blob_root(blob_id: str) -> Path:
+    if not isinstance(blob_id, str) or not re.fullmatch(MAINTENANCE_BLOB_ID_PATTERN, blob_id):
+        raise ValueError("blob_id must contain 3..120 letters, numbers, dot, underscore or hyphen and may not start with punctuation.")
+    root = (MAINTENANCE_BLOB_ROOT / blob_id).resolve(strict=False)
+    try:
+        root.relative_to(MAINTENANCE_BLOB_ROOT)
+    except ValueError as exc:
+        raise PermissionError("Release blob path escapes the maintenance root.") from exc
+    return root
+
+
+def _maintenance_blob_manifest_path(blob_id: str) -> Path:
+    return _maintenance_blob_root(blob_id) / MAINTENANCE_BLOB_MANIFEST
+
+
+def _maintenance_read_blob_manifest(blob_id: str) -> dict[str, Any]:
+    path = _maintenance_blob_manifest_path(blob_id)
+    if not path.is_file() or path.is_symlink():
+        raise FileNotFoundError(f"Release blob manifest is unavailable: {blob_id}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError("Release blob manifest is unreadable.") from exc
+    if not isinstance(value, dict) or value.get("blob_id") != blob_id:
+        raise RuntimeError("Release blob manifest identity mismatch.")
+    return value
+
+
+def _maintenance_blob_chunks(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    chunks = manifest.get("chunks")
+    if not isinstance(chunks, list):
+        raise RuntimeError("Release blob manifest chunk index is invalid.")
+    result: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for row in chunks:
+        if not isinstance(row, dict):
+            raise RuntimeError("Release blob manifest contains an invalid chunk entry.")
+        try:
+            offset = int(row["offset"])
+            size = int(row["size"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("Release blob manifest contains an invalid chunk identity.") from exc
+        digest = str(row.get("sha256") or "").casefold()
+        if offset < 0 or size < 1 or size > MAINTENANCE_MAX_BLOB_CHUNK_BYTES or offset in seen or not re.fullmatch(r"[a-f0-9]{64}", digest):
+            raise RuntimeError("Release blob manifest contains an invalid chunk identity.")
+        seen.add(offset)
+        result.append({"offset": offset, "size": size, "sha256": digest})
+    return sorted(result, key=lambda row: int(row["offset"]))
+
+
+def _maintenance_blob_summary(blob_id: str, manifest: dict[str, Any]) -> dict[str, Any]:
+    chunks = _maintenance_blob_chunks(manifest)
+    received = sum(int(row["size"]) for row in chunks)
+    expected_size = int(manifest.get("size") or 0)
+    contiguous = 0
+    for row in chunks:
+        if int(row["offset"]) != contiguous:
+            break
+        contiguous += int(row["size"])
+    finalized = bool(manifest.get("finalized"))
+    return {
+        "blob_id": blob_id,
+        "release_id": manifest.get("release_id"),
+        "component_role": manifest.get("component_role"),
+        "size": expected_size,
+        "sha256": manifest.get("sha256"),
+        "received_bytes": received,
+        "received_chunks": len(chunks),
+        "contiguous_bytes": contiguous,
+        "complete": contiguous == expected_size and received == expected_size,
+        "finalized": finalized,
+        "blob_ref": blob_id if finalized else None,
+    }
+
+
+def _maintenance_upload_blob_chunk(
+    release_id: str,
+    component_role: str,
+    blob_id: str,
+    blob_size: int,
+    blob_sha256: str,
+    chunk_offset: int,
+    chunk_sha256: str,
+    chunk_base64: str,
+) -> dict[str, Any]:
+    if component_role not in _MAINTENANCE_COMPONENT_FILES:
+        raise ValueError(f"Unsupported release component role: {component_role!r}")
+    if not isinstance(blob_size, int) or isinstance(blob_size, bool) or not 1 <= blob_size <= MAINTENANCE_MAX_COMPONENT_BYTES:
+        raise ValueError(f"blob_size must be 1..{MAINTENANCE_MAX_COMPONENT_BYTES} bytes.")
+    blob_sha256 = str(blob_sha256 or "").casefold()
+    chunk_sha256 = str(chunk_sha256 or "").casefold()
+    if not re.fullmatch(r"[a-f0-9]{64}", blob_sha256) or not re.fullmatch(r"[a-f0-9]{64}", chunk_sha256):
+        raise ValueError("blob_sha256 and chunk_sha256 must be exact SHA-256 digests.")
+    if not isinstance(chunk_offset, int) or isinstance(chunk_offset, bool) or chunk_offset < 0:
+        raise ValueError("chunk_offset must be a non-negative integer.")
+    if not isinstance(chunk_base64, str):
+        raise ValueError("chunk_base64 is required.")
+    try:
+        body = base64.b64decode(chunk_base64, validate=True)
+    except Exception as exc:
+        raise ValueError("chunk_base64 is invalid.") from exc
+    if not body or len(body) > MAINTENANCE_MAX_BLOB_CHUNK_BYTES:
+        raise ValueError(f"Each release blob chunk must be 1..{MAINTENANCE_MAX_BLOB_CHUNK_BYTES} bytes.")
+    if chunk_offset + len(body) > blob_size:
+        raise ValueError("Release blob chunk exceeds the declared blob size.")
+    if not hmac.compare_digest(sha256_bytes(body), chunk_sha256):
+        raise RuntimeError("Release blob chunk SHA mismatch.")
+
+    root = _maintenance_blob_root(blob_id)
+    if root.exists() and (root.is_symlink() or not root.is_dir()):
+        raise PermissionError("Release blob identity is not an owned directory.")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(root, 0o700)
+    manifest_path = root / MAINTENANCE_BLOB_MANIFEST
+    if manifest_path.exists() and manifest_path.is_symlink():
+        raise PermissionError("Release blob manifest may not be a symlink.")
+    if manifest_path.exists():
+        manifest = _maintenance_read_blob_manifest(blob_id)
+        if (
+            manifest.get("release_id") != release_id
+            or manifest.get("component_role") != component_role
+            or int(manifest.get("size") or 0) != blob_size
+            or str(manifest.get("sha256") or "").casefold() != blob_sha256
+        ):
+            raise RuntimeError("Release blob identity does not match the resumed upload.")
+        if manifest.get("finalized"):
+            existing = next((row for row in _maintenance_blob_chunks(manifest) if int(row["offset"]) == chunk_offset), None)
+            if existing and existing["size"] == len(body) and hmac.compare_digest(existing["sha256"], chunk_sha256):
+                return _maintenance_blob_summary(blob_id, manifest)
+            raise RuntimeError("Finalized release blobs are immutable.")
+    else:
+        manifest = {
+            "schema": "mcp_release_blob_v1",
+            "blob_id": blob_id,
+            "release_id": release_id,
+            "component_role": component_role,
+            "size": blob_size,
+            "sha256": blob_sha256,
+            "created_at": now_iso(),
+            "finalized": False,
+            "chunks": [],
+        }
+    chunks = _maintenance_blob_chunks(manifest)
+    existing = next((row for row in chunks if int(row["offset"]) == chunk_offset), None)
+    chunk_path = root / f"chunk-{chunk_offset:012d}.bin"
+    if chunk_path.exists() and (chunk_path.is_symlink() or not chunk_path.is_file()):
+        raise PermissionError("Release blob chunk identity is not an ordinary file.")
+    if existing:
+        if existing["size"] != len(body) or not hmac.compare_digest(existing["sha256"], chunk_sha256):
+            raise RuntimeError("Conflicting bytes were supplied for an already-uploaded release blob offset.")
+        if not chunk_path.is_file() or _sha256_file_stream(chunk_path) != (chunk_sha256, len(body)):
+            raise RuntimeError("Existing release blob chunk failed integrity verification.")
+    else:
+        _atomic_binary_write(chunk_path, body, 0o600)
+        chunks.append({"offset": chunk_offset, "size": len(body), "sha256": chunk_sha256})
+        manifest["chunks"] = sorted(chunks, key=lambda row: int(row["offset"]))
+        atomic_write_json(manifest_path, manifest, 0o600)
+    return _maintenance_blob_summary(blob_id, manifest)
+
+
+def _maintenance_finalize_blob(blob_id: str) -> dict[str, Any]:
+    root = _maintenance_blob_root(blob_id)
+    manifest = _maintenance_read_blob_manifest(blob_id)
+    if manifest.get("finalized"):
+        final_path = root / MAINTENANCE_BLOB_FILE
+        if final_path.is_symlink() or not final_path.is_file():
+            raise RuntimeError("Finalized release blob bytes are missing.")
+        actual_sha, actual_size = _sha256_file_stream(final_path)
+        if actual_sha != manifest.get("sha256") or actual_size != manifest.get("size"):
+            raise RuntimeError("Finalized release blob failed whole-file integrity verification.")
+        return _maintenance_blob_summary(blob_id, manifest)
+    chunks = _maintenance_blob_chunks(manifest)
+    expected_size = int(manifest.get("size") or 0)
+    expected_sha = str(manifest.get("sha256") or "").casefold()
+    cursor = 0
+    digest = hashlib.sha256()
+    final_path = root / MAINTENANCE_BLOB_FILE
+    temp_path = root / f"{MAINTENANCE_BLOB_FILE}.{uuid.uuid4().hex}.tmp"
+    try:
+        with temp_path.open("wb") as output:
+            for row in chunks:
+                offset = int(row["offset"])
+                size = int(row["size"])
+                if offset != cursor:
+                    raise RuntimeError("Release blob chunks must form one contiguous ordered byte stream before finalization.")
+                chunk_path = root / f"chunk-{offset:012d}.bin"
+                if chunk_path.is_symlink() or not chunk_path.is_file():
+                    raise RuntimeError("Release blob chunk is missing or is not an ordinary file.")
+                actual_sha, actual_size = _sha256_file_stream(chunk_path)
+                if actual_sha != row["sha256"] or actual_size != size:
+                    raise RuntimeError("Release blob chunk failed integrity verification.")
+                data = chunk_path.read_bytes()
+                output.write(data)
+                digest.update(data)
+                cursor += size
+            output.flush()
+            os.fsync(output.fileno())
+        if cursor != expected_size or not hmac.compare_digest(digest.hexdigest(), expected_sha):
+            raise RuntimeError("Release blob whole-file SHA or size does not match the declared identity.")
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, final_path)
+        manifest.update({"finalized": True, "finalized_at": now_iso(), "final_size": cursor, "final_sha256": digest.hexdigest()})
+        atomic_write_json(root / MAINTENANCE_BLOB_MANIFEST, manifest, 0o600)
+        return _maintenance_blob_summary(blob_id, manifest)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _maintenance_blob_payload(blob_ref: str, release_id: str, component_role: str, expected_sha256: str) -> tuple[bytes, dict[str, Any]]:
+    manifest = _maintenance_read_blob_manifest(blob_ref)
+    if manifest.get("release_id") != release_id or manifest.get("component_role") != component_role or manifest.get("finalized") is not True:
+        raise RuntimeError("Release component blob is not finalized for this release role.")
+    final_path = _maintenance_blob_root(blob_ref) / MAINTENANCE_BLOB_FILE
+    if final_path.is_symlink() or not final_path.is_file():
+        raise RuntimeError("Release component blob bytes are unavailable.")
+    body = final_path.read_bytes()
+    actual = sha256_bytes(body)
+    if actual != str(manifest.get("sha256") or "").casefold() or actual != expected_sha256 or len(body) != int(manifest.get("size") or 0):
+        raise RuntimeError("Release component blob failed whole-file integrity verification.")
+    return body, {"blob_ref": blob_ref, "blob_sha256": actual, "blob_size": len(body)}
+
+
+def _maintenance_component_payload(components: list[dict[str, Any]] | None, release_id: str | None = None) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
     rows: list[dict[str, Any]] = []
     bodies: dict[str, bytes] = {}
     seen: set[str] = set()
@@ -6890,20 +7288,33 @@ def _maintenance_component_payload(components: list[dict[str, Any]] | None) -> t
         if role not in _MAINTENANCE_COMPONENT_FILES or role in seen:
             raise ValueError(f"components[{index}] has unsupported or duplicate role: {role!r}")
         seen.add(role)
-        encoded = raw.get("content_base64")
         expected = str(raw.get("sha256") or "").casefold()
-        if not isinstance(encoded, str) or not re.fullmatch(r"[a-f0-9]{64}", expected):
-            raise ValueError(f"components[{index}] requires content_base64 and exact sha256.")
-        try:
-            body = base64.b64decode(encoded, validate=True)
-        except Exception as exc:
-            raise ValueError(f"components[{index}] content_base64 is invalid.") from exc
+        if not re.fullmatch(r"[a-f0-9]{64}", expected):
+            raise ValueError(f"components[{index}] requires an exact sha256.")
+        encoded = raw.get("content_base64")
+        blob_ref = raw.get("blob_ref")
+        if isinstance(encoded, str) and blob_ref is not None:
+            raise ValueError(f"components[{index}] may use content_base64 or blob_ref, not both.")
+        blob_metadata: dict[str, Any] = {}
+        if blob_ref is not None:
+            if release_id is None:
+                raise ValueError("blob_ref component transport requires a release identity.")
+            body, blob_metadata = _maintenance_blob_payload(str(blob_ref), release_id, role, expected)
+        else:
+            if not isinstance(encoded, str):
+                raise ValueError(f"components[{index}] requires content_base64 or finalized blob_ref.")
+            try:
+                body = base64.b64decode(encoded, validate=True)
+            except Exception as exc:
+                raise ValueError(f"components[{index}] content_base64 is invalid.") from exc
         if len(body) < 1 or len(body) > MAINTENANCE_MAX_COMPONENT_BYTES:
             raise ValueError(f"components[{index}] size must be 1..{MAINTENANCE_MAX_COMPONENT_BYTES} bytes.")
         actual = sha256_bytes(body)
         if not hmac.compare_digest(actual, expected):
             raise RuntimeError(f"components[{index}] SHA mismatch for role={role}.")
-        rows.append({"role": role, "filename": _MAINTENANCE_COMPONENT_FILES[role], "sha256": actual, "size": len(body), "mode": 0o700 if role in _MAINTENANCE_EXECUTABLE_ROLES else 0o600})
+        row = {"role": role, "filename": _MAINTENANCE_COMPONENT_FILES[role], "sha256": actual, "size": len(body), "mode": 0o700 if role in _MAINTENANCE_EXECUTABLE_ROLES else 0o600, "transport": "blob" if blob_ref is not None else "inline"}
+        row.update(blob_metadata)
+        rows.append(row)
         bodies[role] = body
     if "executor" not in seen or "static_qualifier" not in seen or "release_qualifier" not in seen:
         raise ValueError("Prepared release requires executor, static_qualifier and release_qualifier components.")
@@ -7025,6 +7436,14 @@ def maintenance_status(max_bytes: ToolOutputBytes = 120_000) -> dict[str, Any]:
             armed = json.loads(ARMED_RELEASE_FILE.read_text(encoding="utf-8"))
         except Exception:
             armed = {"unreadable": True}
+    blobs: list[dict[str, Any]] = []
+    for blob_root in sorted(MAINTENANCE_BLOB_ROOT.iterdir() if MAINTENANCE_BLOB_ROOT.is_dir() else []):
+        if not blob_root.is_dir() or blob_root.is_symlink():
+            continue
+        try:
+            blobs.append(_maintenance_blob_summary(blob_root.name, _maintenance_read_blob_manifest(blob_root.name)))
+        except Exception:
+            blobs.append({"blob_id": blob_root.name, "status": "unreadable"})
     controls = {name: _maintenance_file_metadata(path) for name, path in _maintenance_control_targets().items()}
     response = {
         "executor_version": EXECUTOR_VERSION,
@@ -7034,6 +7453,7 @@ def maintenance_status(max_bytes: ToolOutputBytes = 120_000) -> dict[str, Any]:
         "control_targets": controls,
         "prepared_releases": releases,
         "armed_release": armed,
+        "release_blobs": blobs,
         "quiescence": _maintenance_quiescence(),
         "cross_chat_resume": {"supported": True, "authority": "admin bearer credential + durable release state", "conversation_id_required": False},
         "arbitrary_shell_exposed": False,
@@ -7088,12 +7508,47 @@ def maintenance_release(
     dry_run: bool = True,
     reviewed_plan_digest: Sha256String | None = None,
     expected_release_digest: Sha256String | None = None,
+    component_role: str | None = None,
+    blob_id: str | None = None,
+    blob_size: int | None = None,
+    blob_sha256: Sha256String | None = None,
+    chunk_offset: int | None = None,
+    chunk_sha256: Sha256String | None = None,
+    chunk_base64: str | None = None,
+    blob_ref: str | None = None,
 ) -> dict[str, Any]:
-    """Admin-only stage/qualify/status/arm/discard for immutable prepared MCP releases. It never activates a release."""
+    """Admin-only immutable release staging, resumable blob ingestion, qualification and arm/discard controls. It never activates a release."""
     require_admin_scope()
     _require_uuid(operation_id, "operation_id")
     root = _maintenance_release_root(release_id)
     state_path = _maintenance_release_state_path(release_id)
+    if action == "upload_chunk":
+        if not all(value is not None for value in (component_role, blob_id, blob_size, blob_sha256, chunk_offset, chunk_sha256, chunk_base64)):
+            raise ValueError("upload_chunk requires component_role, blob_id, blob_size, blob_sha256, chunk_offset, chunk_sha256 and chunk_base64.")
+        if dry_run:
+            # Validate the transport envelope without creating durable bytes.
+            body = base64.b64decode(str(chunk_base64), validate=True)
+            if not body or len(body) > MAINTENANCE_MAX_BLOB_CHUNK_BYTES:
+                raise ValueError(f"Each release blob chunk must be 1..{MAINTENANCE_MAX_BLOB_CHUNK_BYTES} bytes.")
+            if not hmac.compare_digest(sha256_bytes(body), str(chunk_sha256).casefold()):
+                raise RuntimeError("Release blob chunk SHA mismatch.")
+            if int(chunk_offset) < 0 or int(chunk_offset) + len(body) > int(blob_size):
+                raise ValueError("Release blob chunk exceeds the declared blob size.")
+            return {"release_id": release_id, "component_role": component_role, "blob_id": blob_id, "chunk_offset": chunk_offset, "chunk_size": len(body), "blob_size": blob_size, "blob_sha256": str(blob_sha256).casefold(), "chunk_sha256": str(chunk_sha256).casefold(), "transport": "immutable_chunk", "live_files_mutated": False}
+        summary = _maintenance_upload_blob_chunk(release_id, str(component_role), str(blob_id), int(blob_size), str(blob_sha256), int(chunk_offset), str(chunk_sha256), str(chunk_base64))
+        return {**summary, "transport": "immutable_chunk", "live_files_mutated": False}
+    if action == "finalize_blob":
+        if not blob_ref:
+            raise ValueError("finalize_blob requires blob_ref.")
+        if dry_run:
+            manifest = _maintenance_read_blob_manifest(blob_ref)
+            if manifest.get("release_id") != release_id:
+                raise RuntimeError("Release blob belongs to a different release identity.")
+            return {**_maintenance_blob_summary(blob_ref, manifest), "transport": "immutable_blob", "would_finalize": not bool(manifest.get("finalized")), "live_files_mutated": False}
+        summary = _maintenance_finalize_blob(blob_ref)
+        if summary.get("release_id") != release_id:
+            raise RuntimeError("Release blob belongs to a different release identity.")
+        return {**summary, "transport": "immutable_blob", "live_files_mutated": False}
     if action == "status":
         state = _maintenance_finalize_qualification(release_id, _maintenance_read_release_state(release_id))
         state["files_match"] = _maintenance_release_files_match(state, root)
@@ -7104,7 +7559,7 @@ def maintenance_release(
             raise ValueError("target_version must be a semantic version string.")
         if not expected_current_source_sha256 or not expected_current_launcher_sha256:
             raise ValueError("stage requires exact current source and launcher SHA-256 baselines.")
-        rows, bodies = _maintenance_component_payload(components)
+        rows, bodies = _maintenance_component_payload(components, release_id)
         identity = {"release_id": release_id, "target_version": target_version, "expected_current_source_sha256": expected_current_source_sha256, "expected_current_launcher_sha256": expected_current_launcher_sha256, "components": {row["role"]: row for row in rows}}
         release_digest = _maintenance_release_identity_digest(identity)
         plan_digest = sha256_text(json.dumps({"action": "stage", **identity}, sort_keys=True, separators=(",", ":")))
@@ -7177,6 +7632,7 @@ def maintenance_release(
             '(allow network-outbound (remote ip "localhost:*"))',
             "(deny file-write*)",
             f'(deny file-read* (subpath "{_sandbox_escape(home)}"))',
+            '(allow file-read-metadata)',
             f'(allow file-read* (subpath "{_sandbox_escape(root)}"))',
             f'(allow file-write* (subpath "{_sandbox_escape(root)}"))',
             f'(allow file-read* (subpath "{_sandbox_escape(venv)}"))',

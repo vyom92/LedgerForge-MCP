@@ -89,14 +89,14 @@ async def assert_schema(session,expected_sha):
     listed=await session.list_tools(); tools=getattr(listed,"tools",[]); names={getattr(t,"name",None) or model_dict(t).get("name") for t in tools}
     if names!=EXPECTED_TOOLS: raise RuntimeError(f"tool mismatch missing={sorted(EXPECTED_TOOLS-names)} extra={sorted(names-EXPECTED_TOOLS)}")
     caps=await call(session,"executor_capabilities",{})
-    if (caps.get("executor_version"),caps.get("toolset_revision"),caps.get("schema_contract_revision"))!=("2.6.1",8,"2.6.1"): raise RuntimeError(f"identity mismatch: {caps}")
+    if (caps.get("executor_version"),caps.get("toolset_revision"),caps.get("schema_contract_revision"))!=("2.6.2",9,"2.6.2"): raise RuntimeError(f"identity mismatch: {caps}")
     if caps.get("source_sha256")!=expected_sha or caps.get("annotation_contract_count")!=55: raise RuntimeError("source/tool annotation identity mismatch")
     fp=caps.get("fingerprint_contract") or {}
     if fp.get("worktree_revision")!="2" or fp.get("index_revision")!="1": raise RuntimeError("fingerprint revision metadata missing")
     return caps
 
 def init_repo(repo:Path,bare:Path):
-    repo.mkdir(parents=True); (repo/"README.md").write_text("MCP 2.6.1 isolated qualification\n"); (repo/"SyntheticTests.swift").write_text("import Testing\n@Test func smoke() { #expect(true) }\n")
+    repo.mkdir(parents=True); (repo/"README.md").write_text("MCP 2.6.2 isolated qualification\n"); (repo/"SyntheticTests.swift").write_text("import Testing\n@Test func smoke() { #expect(true) }\n")
     script_dir=repo/"script"; script_dir.mkdir(); validate=script_dir/"validate.sh"; validate.write_text("#!/bin/sh\nset -eu\nexit 0\n"); validate.chmod(0o700)
     run(["git","init","-b","main"],repo); run(["git","config","user.name","MCP Qualification"],repo); run(["git","config","user.email","mcp-qualification@example.invalid"],repo); run(["git","add","."],repo); run(["git","commit","-m","Synthetic baseline"],repo)
     run(["git","init","--bare",str(bare)]); run(["git","remote","add","origin",str(bare)],repo); run(["git","push","-u","origin","main"],repo); run(["git","fetch","origin"],repo)
@@ -121,7 +121,7 @@ async def isolated_calls(port,path,normal,admin,expected_sha,state_root,desktop)
         if "processes" not in snap or "task_workspaces" not in snap or "cleanup_safe" not in snap: raise RuntimeError("snapshot owned-resource grouping missing")
         disc=await call(s,"test_discovery",{"max_results":50,"max_bytes":80000}); sc=disc.get("selector_capabilities") or {}
         if sc.get("zero_test_result_is_acceptance") is not False or "swift_testing_method_selector" not in sc: raise RuntimeError("selector metadata missing")
-        wid=str(uuid.uuid4()); await call(s,"task_workspace",{"operation_id":str(uuid.uuid4()),"workspace_id":wid,"action":"create","task_label":"mcp261-http-close"})
+        wid=str(uuid.uuid4()); await call(s,"task_workspace",{"operation_id":str(uuid.uuid4()),"workspace_id":wid,"action":"create","task_label":"mcp262-http-close"})
         args={"operation_id":str(uuid.uuid4()),"workspace_id":wid,"argv":["/bin/sleep","120"],"cwd_path":"work","execution_class":"scratch","timeout_seconds":180,"expected_exit_codes":[0],"output_paths":[],"dry_run":True}
         plan=await call(s,"process_start",args); digest=plan.get("process_plan_digest")
         args["operation_id"]=str(uuid.uuid4()); args["dry_run"]=False; args["reviewed_plan_digest"]=digest; started=await call(s,"process_start",args)
@@ -184,13 +184,13 @@ async def isolated_calls(port,path,normal,admin,expected_sha,state_root,desktop)
 
 def launch_isolated(candidate:Path,expected_sha:str):
     if fsha(candidate)!=expected_sha: raise RuntimeError("candidate hash mismatch before isolated launch")
-    work=Path(tempfile.mkdtemp(prefix="mcp261-isolated-",dir=str(candidate.parent))).resolve(); bridge=work/"bridge"; desktop=work/"Desktop"; tunnel=work/"tunnel"; repo=work/"repo"; bare=work/"remote.git"; home=work/"home"; tmp=work/"tmp"
+    work=Path(tempfile.mkdtemp(prefix="mcp262-isolated-",dir=str(candidate.parent))).resolve(); bridge=work/"bridge"; desktop=work/"Desktop"; tunnel=work/"tunnel"; repo=work/"repo"; bare=work/"remote.git"; home=work/"home"; tmp=work/"tmp"
     for d in (bridge,desktop,tunnel,home,tmp,home/"Documents"/"Ledger Forge"/"Originals",home/"Library"/"Developer"/"Xcode"/"DerivedData",home/".config"/"tunnel-client"): d.mkdir(parents=True,exist_ok=True)
     init_repo(repo,bare)
     state=bridge/(".executor-runs-v2_1-qualification-"+uuid.uuid4().hex); state.mkdir(); shutil.copy2(candidate,bridge/"executor_v2_1.py"); (desktop/"LedgerForge MCP.command").write_text("#!/bin/zsh\nexit 0\n"); (desktop/"LedgerForge MCP.command").chmod(0o700)
     normal=secrets.token_urlsafe(48); admin=secrets.token_urlsafe(48)
     while admin==normal: admin=secrets.token_urlsafe(48)
-    path="/mcp_qualification_261_"+uuid.uuid4().hex; port=free_port()
+    path="/mcp_qualification_262_"+uuid.uuid4().hex; port=free_port()
     env={"HOME":str(home),"TMPDIR":str(tmp),"PATH":"/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin","USER":os.environ.get("USER",""),"LOGNAME":os.environ.get("LOGNAME",""),"LANG":os.environ.get("LANG","en_US.UTF-8")}
     for k in ("LC_ALL","DEVELOPER_DIR","SDKROOT","TOOLCHAINS","TERM"):
         if os.environ.get(k): env[k]=os.environ[k]
@@ -207,7 +207,7 @@ def launch_isolated(candidate:Path,expected_sha:str):
             if proc.poll() is not None: raise RuntimeError("isolated executor exited:\n"+(proc.stdout.read() if proc.stdout else ""))
             time.sleep(.2)
         else: raise RuntimeError("isolated executor did not listen")
-        result=asyncio.run(isolated_calls(port,path,normal,admin,expected_sha,state,desktop)); print("MCP 2.6.1 ISOLATED HTTP QUALIFICATION: PASS"); print(json.dumps(result,sort_keys=True))
+        result=asyncio.run(isolated_calls(port,path,normal,admin,expected_sha,state,desktop)); print("MCP 2.6.2 ISOLATED HTTP QUALIFICATION: PASS"); print(json.dumps(result,sort_keys=True))
     finally:
         try: os.killpg(proc.pid,15)
         except Exception: pass
@@ -232,17 +232,17 @@ async def live_schema(port,expected_sha,admin=False,smoke=False):
             if ms.get("admin_scope_verified") is not True: raise RuntimeError("live admin scope failed")
         if smoke:
             h=await call(s,"executor_help",{"topic":"overview"}); snap=await call(s,"execution_snapshot",{"max_bytes":120000})
-            if h.get("executor_version")!="2.6.1" or "cleanup_safe" not in snap: raise RuntimeError("live smoke failed")
+            if h.get("executor_version")!="2.6.2" or "cleanup_safe" not in snap: raise RuntimeError("live smoke failed")
         return caps
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--candidate"); ap.add_argument("--expected-source-sha",required=True); ap.add_argument("--port",type=int,default=8768); ap.add_argument("--schema-only-live",action="store_true"); ap.add_argument("--live-smoke",action="store_true"); ap.add_argument("--admin-smoke-live",action="store_true"); ap.add_argument("--recovery-status-live",action="store_true"); a=ap.parse_args()
     if a.schema_only_live:
-        c=asyncio.run(live_schema(a.port,a.expected_source_sha)); print("MCP 2.6.1 LIVE SCHEMA QUALIFICATION: PASS"); print(json.dumps(c,sort_keys=True)); return
+        c=asyncio.run(live_schema(a.port,a.expected_source_sha)); print("MCP 2.6.2 LIVE SCHEMA QUALIFICATION: PASS"); print(json.dumps(c,sort_keys=True)); return
     if a.live_smoke:
-        c=asyncio.run(live_schema(a.port,a.expected_source_sha,smoke=True)); print("MCP 2.6.1 LIVE SMOKE: PASS"); print(json.dumps(c,sort_keys=True)); return
+        c=asyncio.run(live_schema(a.port,a.expected_source_sha,smoke=True)); print("MCP 2.6.2 LIVE SMOKE: PASS"); print(json.dumps(c,sort_keys=True)); return
     if a.admin_smoke_live:
-        c=asyncio.run(live_schema(a.port,a.expected_source_sha,admin=True,smoke=True)); print("MCP 2.6.1 LIVE ADMIN SMOKE: PASS"); print(json.dumps(c,sort_keys=True)); return
+        c=asyncio.run(live_schema(a.port,a.expected_source_sha,admin=True,smoke=True)); print("MCP 2.6.2 LIVE ADMIN SMOKE: PASS"); print(json.dumps(c,sort_keys=True)); return
     if a.recovery_status_live:
         path,token=persisted_identity(False)
         async def r():

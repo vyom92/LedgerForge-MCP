@@ -72,7 +72,7 @@ async def expect_error(session: ClientSession, name: str, arguments: dict[str, A
     return False
 
 
-def endpoint(port: int) -> tuple[str, dict[str, str]]:
+def endpoint(port: int, token: str | None = None) -> tuple[str, dict[str, str]]:
     root = Path.home() / "ledgerforge-mcp-prototype"
     token_path = root / ".executor-token"
     path_file = root / ".executor-path"
@@ -80,7 +80,8 @@ def endpoint(port: int) -> tuple[str, dict[str, str]]:
         path_file = root / ".mcp-path"
     if not token_path.is_file() or not path_file.is_file():
         raise RuntimeError("Persisted MCP identity is missing.")
-    token = token_path.read_text(encoding="utf-8").strip()
+    if token is None:
+        token = token_path.read_text(encoding="utf-8").strip()
     path = path_file.read_text(encoding="utf-8").strip()
     if not token or not path:
         raise RuntimeError("Persisted MCP identity is empty.")
@@ -88,8 +89,9 @@ def endpoint(port: int) -> tuple[str, dict[str, str]]:
 
 
 @asynccontextmanager
-async def open_session(port: int) -> AsyncIterator[ClientSession]:
-    url, headers = endpoint(port)
+async def open_session(port: int, token: str | None = None) -> AsyncIterator[ClientSession]:
+    """Open an authenticated local session; an explicit token is never logged."""
+    url, headers = endpoint(port, token)
     parameters = inspect.signature(streamablehttp_client).parameters
     if "headers" in parameters:
         kwargs = {"headers": headers}

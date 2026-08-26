@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -16,10 +17,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-ADMIN_VERSION = "mcp-2.6.0-owner-recovery-r4"
+ADMIN_VERSION = "mcp-2.6.2-owner-recovery-r1"
 ROOT = (Path.home() / "ledgerforge-mcp-prototype").resolve()
 STATE_PTR = ROOT / ".executor-v2.1-state-root"
 EXECUTOR_SOURCE = ROOT / "executor_v2_1.py"
+EXECUTOR_SOURCE_ALIASES = frozenset({
+    str(EXECUTOR_SOURCE),
+    str(Path.home() / "ledgerforge-mcp-prototype" / "executor_v2_1.py"),
+})
 PORT = 8768
 AUDIT_DIR = ROOT / "mcp-owner-recovery-audit"
 BACKUP_DIR = ROOT / "mcp-owner-recovery-backups"
@@ -129,19 +134,40 @@ def pid_alive(pid: int) -> bool:
     except (ProcessLookupError, PermissionError):
         return False
 
+def executor_script_identity(command: str) -> str | None:
+    """Return the exact accepted executor script spelling in a process argv.
+
+    The launcher is allowed to retain the historical compatibility-symlink spelling,
+    but no arbitrary Python process or similarly named script is accepted.  The
+    lexical spelling must be one of the two known paths and its resolved target must
+    be the canonical executor source.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    for token in argv[1:]:
+        if token not in EXECUTOR_SOURCE_ALIASES:
+            continue
+        try:
+            if Path(token).resolve(strict=False) == EXECUTOR_SOURCE:
+                return token
+        except OSError:
+            continue
+    return None
+
 def executor_pids() -> list[int]:
     result: list[int] = []
     p = subprocess.run(
         ["ps", "-axo", "pid=,command="],
         capture_output=True, text=True, check=False, timeout=10,
     )
-    needle = str(EXECUTOR_SOURCE)
     for line in p.stdout.splitlines():
         line = line.strip()
         if not line:
             continue
         head, _, cmd = line.partition(" ")
-        if head.isdigit() and needle in cmd:
+        if head.isdigit() and executor_script_identity(cmd) is not None:
             result.append(int(head))
     return sorted(set(result))
 
@@ -311,7 +337,7 @@ def stop_executor(*, kill_after_timeout: bool = False, all_exact: bool = False) 
     for pid in ep:
         start = process_start(pid)
         cmd = process_command(pid)
-        if str(EXECUTOR_SOURCE) not in cmd:
+        if executor_script_identity(cmd) is None:
             raise RecoveryError(f"Executor PID {pid} identity changed before stop.")
         os.kill(pid, signal.SIGTERM)
         deadline = time.monotonic() + 8.0
@@ -324,7 +350,7 @@ def stop_executor(*, kill_after_timeout: bool = False, all_exact: bool = False) 
                     f"Executor PID {pid} did not terminate after SIGTERM. "
                     "Re-run with --kill-after-timeout only for explicit break-glass termination."
                 )
-            if process_start(pid) != start or str(EXECUTOR_SOURCE) not in process_command(pid):
+            if process_start(pid) != start or executor_script_identity(process_command(pid)) is None:
                 raise RecoveryError(f"Executor PID {pid} identity changed; refusing SIGKILL.")
             os.kill(pid, signal.SIGKILL)
             used_kill = True
@@ -634,6 +660,16 @@ def self_test() -> None:
             AUDIT_DIR = base / "audit"
             globals()["executor_pids"] = lambda: []
             globals()["listener_pids"] = lambda: []
+
+            # The live launcher may spell the same executor through either the
+            # canonical checkout or its preserved compatibility symlink.  Only
+            # those two exact identities are accepted; arbitrary Python argv is not.
+            canonical_cmd = f"/usr/bin/python3 {EXECUTOR_SOURCE}"
+            symlink_cmd = f"/usr/bin/python3 {Path.home() / 'ledgerforge-mcp-prototype' / 'executor_v2_1.py'}"
+            assert executor_script_identity(canonical_cmd) == str(EXECUTOR_SOURCE)
+            assert executor_script_identity(symlink_cmd) == str(Path.home() / "ledgerforge-mcp-prototype" / "executor_v2_1.py")
+            assert executor_script_identity("/usr/bin/python3 /tmp/executor_v2_1.py") is None
+            assert executor_script_identity("/usr/bin/python3 -c 'import executor_v2_1'") is None
 
             # CASE 1: active clean lease, no validation -> local owner release.
             c1 = base / "case1"

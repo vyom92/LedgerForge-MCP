@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-ACTIVATOR_VERSION = "mcp-release-activator-1.1"
+ACTIVATOR_VERSION = "mcp-release-activator-1.2"
 RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,119}$")
 REQUIRED_ROLES = {
     "executor", "static_qualifier", "isolated_qualifier", "release_qualifier",
@@ -14,7 +14,7 @@ REQUIRED_ROLES = {
 }
 ROOT = Path(os.environ.get("LEDGERFORGE_MCP_ACTIVATOR_ROOT", str(Path.home() / "ledgerforge-mcp-prototype"))).expanduser().resolve()
 DESKTOP = Path(os.environ.get("LEDGERFORGE_MCP_ACTIVATOR_DESKTOP", str(Path.home() / "Desktop"))).expanduser().resolve()
-PYTHON = Path(os.environ.get("LEDGERFORGE_MCP_ACTIVATOR_PYTHON", str(ROOT / ".venv/bin/python"))).expanduser().resolve()
+PYTHON = Path(os.environ.get("LEDGERFORGE_MCP_ACTIVATOR_PYTHON", str(ROOT / ".venv/bin/python"))).expanduser()
 PORT = int(os.environ.get("LEDGERFORGE_MCP_ACTIVATOR_PORT", "8768"))
 MAINT = ROOT / ".mcp-maintenance"
 ARMED = MAINT / "armed-release.json"
@@ -127,10 +127,16 @@ def validate_release(release_id: str) -> tuple[dict[str,Any],dict[str,Any],Path]
     if missing or extra: raise RuntimeError(f"activation component set mismatch missing={missing} extra={extra}")
     for role,row in comps.items():
         if not isinstance(row,dict): raise RuntimeError(f"invalid component row: {role}")
-        p=root/str(row.get("filename") or "")
+        expected_filename = {
+            "executor": "executor_v2_1.py", "static_qualifier": "qualify_executor_current_static.py", "isolated_qualifier": "qualify_executor_current_isolated.py", "release_qualifier": "qualify_release.py", "main_launcher": "LedgerForge MCP.command", "owner_admin": "ledgerforge_mcp_owner_admin.py", "owner_wrapper": "LedgerForge MCP Owner Recovery.command", "owner_version": ".mcp-owner-recovery-version", "release_activator": "ledgerforge_mcp_release_activator.py", "release_version": ".mcp-release-version",
+        }[role]
+        if row.get("filename") != expected_filename: raise RuntimeError(f"prepared component filename mismatch: {role}")
+        p=root/expected_filename
         if p.is_symlink() or not p.is_file(): raise RuntimeError(f"prepared component missing: {role}")
         if p.stat().st_size!=int(row.get("size") or -1) or sha_file(p)!=row.get("sha256"):
             raise RuntimeError(f"prepared component identity changed: {role}")
+        expected_mode = 0o700 if role not in {"owner_version", "release_version"} else 0o600
+        if stat.S_IMODE(p.stat().st_mode) != expected_mode: raise RuntimeError(f"prepared component mode mismatch: {role}")
     live_source=component_target("executor"); live_launcher=component_target("main_launcher")
     if live_source.is_symlink() or not live_source.is_file() or sha_file(live_source)!=state.get("expected_current_source_sha256"):
         raise RuntimeError("current executor source identity mismatch")
@@ -168,6 +174,13 @@ def restore_backup(bdir: Path, manifest: dict[str,Any]) -> None:
         elif target.exists():
             if not target.is_file(): raise RuntimeError(f"rollback cannot remove non-file: {role}")
             target.unlink()
+    for role,rec in manifest["files"].items():
+        target=component_target(role)
+        if rec["existed"]:
+            if target.is_symlink() or not target.is_file() or sha_file(target)!=rec["sha256"] or target.stat().st_size!=rec["size"] or stat.S_IMODE(target.stat().st_mode)!=int(rec["mode"]):
+                raise RuntimeError(f"rollback verification failed: {role}")
+        elif target.exists():
+            raise RuntimeError(f"rollback absent-target verification failed: {role}")
     if sha_file(component_target("executor"))!=manifest["expected_current_source_sha256"]: raise RuntimeError("rollback executor verification failed")
     if sha_file(component_target("main_launcher"))!=manifest["expected_current_launcher_sha256"]: raise RuntimeError("rollback launcher verification failed")
 
@@ -183,9 +196,12 @@ def install_release(root: Path, state: dict[str,Any]) -> None:
         if sha_file(p)!=row["sha256"] or p.stat().st_size!=row["size"]: raise RuntimeError(f"installed component verification failed: {role}")
 
 def qualify_live(state: dict[str,Any]) -> None:
+    if PYTHON.is_symlink() and not PYTHON.exists(): raise RuntimeError(f"configured MCP Python interpreter is a broken symlink: {PYTHON}")
+    if not PYTHON.is_file() or not os.access(PYTHON, os.X_OK): raise RuntimeError(f"configured MCP Python interpreter is not executable: {PYTHON}")
     q=component_target("isolated_qualifier"); source=component_target("executor"); sh=sha_file(source)
     run([str(PYTHON),str(q),"--port",str(PORT),"--schema-only-live","--expected-source-sha",sh],timeout=180)
     run([str(PYTHON),str(q),"--port",str(PORT),"--live-smoke","--expected-source-sha",sh],timeout=240)
+    run([str(PYTHON),str(q),"--port",str(PORT),"--admin-smoke-live","--expected-source-sha",sh],timeout=240)
     run([str(PYTHON),str(component_target("owner_admin")),"self-test"],timeout=240)
 
 def receipt_path(prefix: str, release_id: str) -> Path:
