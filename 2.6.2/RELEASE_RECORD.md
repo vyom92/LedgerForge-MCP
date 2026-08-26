@@ -96,12 +96,17 @@ bind the operational evidence to the same release identity.
 - Activation result: `deployed`.
 - Activation receipt: `2.6.2-deployment-r3.json` in this directory and the
   durable operational receipt named above.
-- Rollback backup root:
+- Immediate pre-r3 rollback backup root (the accepted r2 2.6.2 bytes):
   `/Users/vyom/Applications/LedgerForge-MCP/mcp-activation-backups/20260826T190545.664252Z-mcp-2.6.2-luna-20260827-final-r3`
-- The accepted 2.6.1 source, launcher and owner-admin bytes were captured before
-  activation and remain available under the 2.6.1 package and rollback stores.
-- Earlier r1 and r2 activation attempts are retained as failure evidence. Each
-  failed closed and restored 2.6.1; no partial activation was accepted.
+- Accepted 2.6.1 rollback root:
+  `/Users/vyom/Applications/LedgerForge-MCP/mcp-activation-backups/20260826T184230.036073Z-mcp-2.6.2-luna-20260827-final-r2`
+  (its `executor.backup`, `main_launcher.backup`, `owner_admin.backup`,
+  `static_qualifier.backup`, `isolated_qualifier.backup` and
+  `release_activator.backup` hashes match the accepted 2.6.1 baseline).
+- The accepted 2.6.1 package and rollback stores remain available. The first
+  two failed activation attempts failed closed and restored 2.6.1; r2 then
+  deployed as an intermediate 2.6.2 release, and r3 deployed successfully. No
+  partial activation was accepted.
 
 ## Live acceptance
 
