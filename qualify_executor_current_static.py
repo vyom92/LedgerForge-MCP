@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import ast, hashlib, sys
+import ast, base64, bz2, hashlib, sys
 from pathlib import Path
 
 EXPECTED = {
-    "executor_capabilities","host_status","workspace_state","execution_lease_status","executor_recovery_status","execution_snapshot",
+    "workspace_projects","executor_capabilities","host_status","workspace_state","execution_lease_status","executor_recovery_status","execution_snapshot",
     "acquire_execution_lease","heartbeat_execution_lease","resume_execution_lease","release_execution_lease",
     "list_files","read_file","search_files","artifact_inspect","git_inspect","evidence_batch",
-    "apply_file_ops","git_fetch_origin","git_stage","precommit_privacy_scan","git_commit","git_push","run_repo_task",
+    "apply_file_ops","git_fetch_origin","git_stage","precommit_privacy_scan","git_commit","adopt_publication_candidate","git_push","run_repo_task",
     "start_validation","validation_status","validation_result","cancel_validation","test_discovery","documentation_sync_preflight",
     "cycle_close_evidence","runtime_launch","runtime_status","runtime_logs","runtime_stop","test_impact_advisor","performance_probe",
     "swift_xcode_audit","repository_recovery_analysis","fixture_provenance_inspect","run_regression_campaign","private_context_matrix",
@@ -29,15 +29,26 @@ def tools(tree):
                 if isinstance(d,ast.Call) and isinstance(d.func,ast.Name) and d.func.id=="tool": out.add(n.name)
     return out
 
-source=Path(sys.argv[1]).resolve(); data=source.read_bytes(); text=data.decode("utf-8"); tree=ast.parse(text,filename=str(source))
+source=Path(sys.argv[1]).resolve(); data=source.read_bytes(); raw_text=data.decode("utf-8"); raw_tree=ast.parse(raw_text,filename=str(source))
+try:
+    embedded=literal(raw_tree,"EMBEDDED_IMPLEMENTATION_B85")
+    embedded_sha=literal(raw_tree,"EMBEDDED_IMPLEMENTATION_SHA256")
+except Exception:
+    text=raw_text; tree=raw_tree
+else:
+    if not isinstance(embedded,(bytes,str)): raise AssertionError("invalid embedded implementation payload")
+    encoded=embedded.encode("ascii") if isinstance(embedded,str) else embedded
+    inner=bz2.decompress(base64.b85decode(encoded))
+    if hashlib.sha256(inner).hexdigest()!=embedded_sha: raise AssertionError("embedded implementation SHA mismatch")
+    text=inner.decode("utf-8"); tree=ast.parse(text,filename=str(source)+"::<embedded>")
 assert any(isinstance(n,ast.Import) and any(a.name=="sys" for a in n.names) for n in tree.body), "missing top-level import sys"
-assert literal(tree,"EXECUTOR_VERSION")=="2.6.2"
-assert literal(tree,"TOOLSET_REVISION")==9
-assert literal(tree,"SCHEMA_CONTRACT_REVISION")=="2.6.2"
+assert literal(tree,"EXECUTOR_VERSION")=="3.0.0"
+assert literal(tree,"TOOLSET_REVISION")==11
+assert literal(tree,"SCHEMA_CONTRACT_REVISION")=="3.0.0"
 assert tools(tree)==EXPECTED,(sorted(EXPECTED-tools(tree)),sorted(tools(tree)-EXPECTED))
 contract=literal(tree,"TOOL_ANNOTATION_CONTRACT")
 assert set(contract)==EXPECTED
-assert len(contract)==55
+assert len(contract)==57
 for name in ("local_fs_inspect","process_status","process_wait","process_result","executor_help","validation_wait_result","maintenance_status","maintenance_file_inspect"):
     assert contract[name]["read_only"] is True
 for name in ("local_fs_mutate","task_workspace","process_start","process_cancel","maintenance_release"):
@@ -142,10 +153,33 @@ assert 'arbitrary_caller_paths' in text and 'whole_file_sha256_required' in text
 assert 'finalize_blob requires blob_ref' in text
 assert 'components[{index}] requires content_base64 or finalized blob_ref.' in text
 
+# 2.6.4 interrupted-publication recovery contract. Adoption is an explicit,
+# lease-bound capability; git_push must continue to require the resulting
+# publication candidate rather than inferring authority from validation alone.
+assert 'def adopt_publication_candidate(' in text
+assert '"adopt_publication_candidate"' in text
+assert 'source = "adopted-existing-commit"' in text or '"source": "adopted-existing-commit"' in text
+assert 'publication_candidate' in text and 'expected_origin_main' in text
+assert 'git diff-tree' in text or 'diff-tree' in text
+assert 'origin/main' in text and 'ancestor' in text
+assert 'scan_commit' in text or 'scan_commit_blobs' in text or 'scan_tree_blobs' in text
+assert 'operation_id' in text and 'adoption' in text
+assert 'No validated publication state' in text or 'No validation state is bound' in text
+
+assert 'PUBLICATION_POLICY_REVISION = "effect-aware-publication-v2"' in text
+for name in ("_pbx_parse", "_pbx_resource_delta", "_markdown_hardbreak_lines"):
+    assert name in {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+assert '"resource_manifest": rows' in text
+assert "All pre-staged paths must be included for complete effect classification." in text
+assert "Documentation-static evidence no longer matches the worktree." in text
+assert 'documentation_static' in text and 'project_integrity_compile' in text and 'test_executing' in text
+assert 'markdown-hard-break-two-spaces' in text
+assert 'semantic_exceptions' in text
+assert 'validation_bound' not in text[text.find("def git_stage("):text.find("def precommit_privacy_scan(")]
 compile(text,str(source),"exec")
-print("MCP 2.6.2 STATIC QUALIFICATION: PASS")
+print("MCP 3.0.0 STATIC QUALIFICATION: PASS")
 print("source_sha256="+hashlib.sha256(data).hexdigest())
-print("tool_count=55")
+print("tool_count=57")
 print("binary_filesystem_contract=PASS")
 print("task_workspace_contract=PASS")
 print("reviewed_process_contract=PASS")

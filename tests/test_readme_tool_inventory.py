@@ -52,7 +52,7 @@ class ReadmeToolInventoryTests(unittest.TestCase):
         rows = documented_rows()
         names = [name for name, _ in rows]
 
-        self.assertEqual(55, len(contract), "Toolset Revision 9 must contain 55 annotated tools")
+        self.assertEqual(57, len(contract), "Toolset Revision 11 must contain 57 annotated tools")
         self.assertEqual(len(names), len(set(names)), "README contains a duplicate documented tool")
         self.assertEqual(set(contract), set(names), "README tool set drifted from TOOL_ANNOTATION_CONTRACT")
         self.assertEqual(len(contract), len(names), "README must document every active tool exactly once")

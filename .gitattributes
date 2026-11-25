@@ -1,4 +1,0 @@
-# The deployed 2.6.2 executor is an immutable byte-for-byte release copy.
-# Preserve its accepted legacy whitespace so the Git package hash remains
-# identical to the qualified and activated component.
-2.6.2/runtime/executor_v2_1.py -whitespace

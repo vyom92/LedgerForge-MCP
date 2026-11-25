@@ -73,7 +73,7 @@ async def expect_error(session: ClientSession, name: str, arguments: dict[str, A
 
 
 def endpoint(port: int, token: str | None = None) -> tuple[str, dict[str, str]]:
-    root = Path.home() / "ledgerforge-mcp-prototype"
+    root = Path(__file__).resolve().parent
     token_path = root / ".executor-token"
     path_file = root / ".executor-path"
     if not path_file.is_file() and (root / ".mcp-path").is_file():

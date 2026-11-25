@@ -51,3 +51,9 @@ previous/
 
 # Local authentication material
 .executor-auth-header
+
+# Local registered secret references and private handoffs
+.executor-secret-refs.json
+
+# Retained private pre-migration release bundle
+2.6.3/

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct-loopback acceptance for the deployed MCP 2.6.2 control plane.
+"""Direct-loopback acceptance for the installed ChatGPT MCP control plane.
 
 The script deliberately reads the two protected bearer files without printing
 their contents.  It exercises the local executor directly, so a tunnel or MCP
@@ -28,7 +28,7 @@ def digest(body: bytes) -> str:
 
 
 def persisted_identity(admin: bool = False) -> tuple[str, str]:
-    root = (Path.home() / "ledgerforge-mcp-prototype").resolve()
+    root = ROOT
     path_file = root / ".executor-path"
     if not path_file.is_file():
         path_file = root / ".mcp-path"
@@ -40,7 +40,7 @@ def existing_completed_validation() -> str | None:
     pointer = ROOT / ".executor-v2.1-state-root"
     if not pointer.is_file():
         return None
-    state_root = Path(pointer.read_text(encoding="utf-8").strip()).expanduser()
+    state_root = ROOT / Path(pointer.read_text(encoding="utf-8").strip()).expanduser()
     candidates: list[tuple[float, str]] = []
     for path in state_root.glob("*.json"):
         try:
@@ -72,22 +72,24 @@ async def run() -> dict[str, object]:
         "release_blob_resume_finalize_stage_discard": "FAIL",
     }
 
-    async with open_session(8768) as normal:
+    settings = ROOT / ".mcp-maintenance/service-ports.json"
+    port = json.loads(settings.read_text())["executor"] if settings.is_file() else 8768
+    async with open_session(port) as normal:
         listed = await normal.list_tools()
         tool_names = sorted(getattr(tool, "name", "") for tool in listed.tools)
-        if len(tool_names) != 55 or "executor_help" not in tool_names or "maintenance_release" not in tool_names:
+        if len(tool_names) != 57 or "executor_help" not in tool_names or "maintenance_release" not in tool_names:
             raise RuntimeError(f"unexpected tool surface: count={len(tool_names)}")
         caps = await call(normal, "executor_capabilities", {})
-        if (caps.get("executor_version"), caps.get("toolset_revision"), caps.get("schema_contract_revision")) != ("2.6.2", 9, "2.6.2"):
+        if (caps.get("executor_version"), caps.get("toolset_revision"), caps.get("schema_contract_revision")) != ("3.0.0", 11, "3.0.0"):
             raise RuntimeError("live identity contract mismatch")
-        if caps.get("source_sha256") != expected_source or caps.get("annotation_contract_count") != 55:
+        if caps.get("source_sha256") != expected_source or caps.get("annotation_contract_count") != 57:
             raise RuntimeError("live source or annotation identity mismatch")
 
         help_result = await call(normal, "executor_help", {"topic": "maintenance"})
         rendered_help = json.dumps(help_result, sort_keys=True)
         if "durable" not in rendered_help or normal_token in rendered_help or admin_token in rendered_help:
             raise RuntimeError("executor_help was not bounded or exposed a credential")
-        snapshot = await call(normal, "execution_snapshot", {"max_bytes": 120000})
+        snapshot = await call(normal, "execution_snapshot", {"project": "LedgerForge", "max_bytes": 120000})
         if snapshot.get("snapshot_schema_revision") != "execution-snapshot-v2" or not all(key in snapshot for key in ("processes", "task_workspaces", "cleanup_safe")):
             raise RuntimeError("execution_snapshot v2 grouping missing")
         evidence["execution_snapshot_v2"] = "PASS"
@@ -101,11 +103,11 @@ async def run() -> dict[str, object]:
         evidence["normal_admin_separation"] = "PASS"
 
         workspace_id = str(uuid.uuid4())
-        await call(normal, "task_workspace", {"operation_id": str(uuid.uuid4()), "workspace_id": workspace_id, "action": "create", "task_label": "mcp262-direct-acceptance"})
-        workspace_status = await call(normal, "task_workspace", {"operation_id": str(uuid.uuid4()), "workspace_id": workspace_id, "action": "status"})
+        await call(normal, "task_workspace", {"project": "LedgerForge", "operation_id": str(uuid.uuid4()), "workspace_id": workspace_id, "action": "create", "task_label": "native-mcp-direct-acceptance"})
+        workspace_status = await call(normal, "task_workspace", {"project": "LedgerForge", "operation_id": str(uuid.uuid4()), "workspace_id": workspace_id, "action": "status"})
         if workspace_status.get("exists") is not True:
             raise RuntimeError("task workspace was not created")
-        closed = await call(normal, "task_workspace", {"operation_id": str(uuid.uuid4()), "workspace_id": workspace_id, "action": "close", "wait_seconds": 5})
+        closed = await call(normal, "task_workspace", {"project": "LedgerForge", "operation_id": str(uuid.uuid4()), "workspace_id": workspace_id, "action": "close", "wait_seconds": 5})
         if closed.get("closed") is not True or closed.get("exists_after") is not False:
             raise RuntimeError("task workspace did not close cleanly")
         evidence["task_workspace_lifecycle"] = "PASS"
@@ -113,21 +115,21 @@ async def run() -> dict[str, object]:
         validation_run = existing_completed_validation()
         if validation_run:
             try:
-                terminal = await call(normal, "validation_wait_result", {"run_id": validation_run, "wait_seconds": 0, "detail": "summary", "max_bytes": 80000})
+                terminal = await call(normal, "validation_wait_result", {"project": "LedgerForge", "run_id": validation_run, "wait_seconds": 0, "detail": "summary", "max_bytes": 80000})
                 if terminal.get("status") == "completed" and terminal.get("result_ready") is True and terminal.get("retry_safe") is True:
                     evidence["durable_validation_terminal_retrieval"] = "PASS"
             except Exception:
                 pass
 
     try:
-        async with open_session(8768, "invalid-" + uuid.uuid4().hex) as invalid:
+        async with open_session(port, "invalid-" + uuid.uuid4().hex) as invalid:
             await invalid.list_tools()
     except Exception:
         evidence["invalid_token_refusal"] = "PASS"
 
     _, admin_token = persisted_identity(True)
-    async with open_session(8768, admin_token) as admin:
-        status = await call(admin, "maintenance_status", {})
+    async with open_session(port, admin_token) as admin:
+        status = await call(admin, "maintenance_status", {"max_bytes": 120000})
         if status.get("admin_scope_verified") is not True or status.get("credential_values_exposed") is not False:
             raise RuntimeError("admin maintenance status contract mismatch")
         source_meta = await call(admin, "maintenance_file_inspect", {"target": "executor_source", "action": "hash"})
@@ -140,7 +142,7 @@ async def run() -> dict[str, object]:
         if not await expect_error(admin, "maintenance_file_inspect", {"target": "../../.ssh", "action": "stat"}):
             raise RuntimeError("maintenance target allowlist was bypassed")
 
-        inline_release = "mcp-2.6.2-direct-inline-" + uuid.uuid4().hex[:12]
+        inline_release = "mcp-3.0.0-direct-inline-" + uuid.uuid4().hex[:12]
         inline_bodies = {"executor": b"inline-executor", "static_qualifier": b"inline-static", "release_qualifier": b"inline-release"}
         inline_components = [{"role": role, "sha256": digest(body), "content_base64": base64.b64encode(body).decode("ascii")} for role, body in inline_bodies.items()]
         inline_plan = await call(admin, "maintenance_release", {"operation_id": str(uuid.uuid4()), "release_id": inline_release, "action": "stage", "target_version": "9.9.9", "expected_current_source_sha256": expected_source, "expected_current_launcher_sha256": launcher_sha, "components": inline_components, "dry_run": True})
@@ -152,9 +154,9 @@ async def run() -> dict[str, object]:
         evidence["maintenance_status_and_inspect"] = "PASS"
         evidence["release_inline_stage_status_discard"] = "PASS"
 
-        blob_release = "mcp-2.6.2-direct-blob-" + uuid.uuid4().hex[:12]
+        blob_release = "mcp-3.0.0-direct-blob-" + uuid.uuid4().hex[:12]
         blob_components: list[dict[str, str]] = []
-        for role, body in {"executor": b"blob-executor-262", "static_qualifier": b"blob-static-262", "release_qualifier": b"blob-release-262"}.items():
+        for role, body in {"executor": b"blob-executor-300", "static_qualifier": b"blob-static-300", "release_qualifier": b"blob-release-300"}.items():
             blob_id = "blob-direct-" + role.replace("_", "-") + "-" + uuid.uuid4().hex[:8]
             midpoint = len(body) // 2
             parts = [(0, body[:midpoint]), (midpoint, body[midpoint:])]

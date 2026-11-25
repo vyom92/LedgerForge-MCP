@@ -17,19 +17,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-ADMIN_VERSION = "mcp-2.6.2-owner-recovery-r1"
-ROOT = (Path.home() / "ledgerforge-mcp-prototype").resolve()
+ADMIN_VERSION = "mcp-3.0.0-owner-recovery-r1"
+ROOT = Path(os.environ.get("LEDGERFORGE_EXECUTOR_BRIDGE_ROOT", Path(__file__).resolve().parent)).resolve()
 STATE_PTR = ROOT / ".executor-v2.1-state-root"
 EXECUTOR_SOURCE = ROOT / "executor_v2_1.py"
-EXECUTOR_SOURCE_ALIASES = frozenset({
-    str(EXECUTOR_SOURCE),
-    str(Path.home() / "ledgerforge-mcp-prototype" / "executor_v2_1.py"),
-})
-PORT = 8768
+EXECUTOR_SOURCE_ALIASES = frozenset({str(EXECUTOR_SOURCE)})
+_port_file = ROOT / ".mcp-maintenance/service-ports.json"
+PORT = int(os.environ.get("LEDGERFORGE_EXECUTOR_PORT") or (json.loads(_port_file.read_text())["executor"] if _port_file.is_file() else 8768))
 AUDIT_DIR = ROOT / "mcp-owner-recovery-audit"
 BACKUP_DIR = ROOT / "mcp-owner-recovery-backups"
 LOCK_FILE = ROOT / ".mcp-owner-recovery.lock"
-DESKTOP_LAUNCHER = Path.home() / "Desktop" / "LedgerForge MCP.command"
+DESKTOP_LAUNCHER = ROOT / "mcp_control.py"
 
 SAFE_STALE_ACTIONS = {
     "acquire_execution_lease",
@@ -93,12 +91,17 @@ def state_root(override: str | None = None) -> Path:
         raw = STATE_PTR.read_text(encoding="utf-8").strip()
         if not raw:
             raise RecoveryError("State-root pointer is empty.")
-        root = Path(raw).expanduser().resolve()
+        root = (ROOT / Path(raw).expanduser()).resolve()
     try:
         root.relative_to(ROOT)
     except ValueError as exc:
         raise RecoveryError(f"State root escapes MCP bridge root: {root}") from exc
-    if not root.name.startswith(".executor-runs-v2_1-production-"):
+    if override and root.parent.name == "projects" and root.parent.parent == state_root():
+        identity = read_json(root / "identity.json")
+        if hashlib.sha256(identity["project"].encode()).hexdigest() != root.name:
+            raise RecoveryError("Project recovery identity mismatch.")
+        return root
+    if root.parent != ROOT or not root.name.startswith(".executor-runs-v2_1-production-"):
         raise RecoveryError(f"Refusing non-production state-root namespace: {root.name}")
     if not root.is_dir():
         raise RecoveryError(f"Production state root missing: {root}")
@@ -135,18 +138,14 @@ def pid_alive(pid: int) -> bool:
         return False
 
 def executor_script_identity(command: str) -> str | None:
-    """Return the exact accepted executor script spelling in a process argv.
-
-    The launcher is allowed to retain the historical compatibility-symlink spelling,
-    but no arbitrary Python process or similarly named script is accepted.  The
-    lexical spelling must be one of the two known paths and its resolved target must
-    be the canonical executor source.
-    """
+    """Recognize the installed source only when it is the interpreter's script argument."""
     try:
         argv = shlex.split(command)
     except ValueError:
         return None
-    for token in argv[1:]:
+    if len(argv) < 2 or not Path(argv[0]).name.lower().startswith("python"):
+        return None
+    for token in argv[1:2]:
         if token not in EXECUTOR_SOURCE_ALIASES:
             continue
         try:
@@ -230,6 +229,7 @@ def public_lease(lease: dict[str, Any] | None) -> dict[str, Any] | None:
 
 def scan_state(sr: Path) -> dict[str, Any]:
     p = paths(sr)
+    unreadable = []
     lease = None
     lease_error = None
     if p["lease"].exists():
@@ -258,6 +258,7 @@ def scan_state(sr: Path) -> dict[str, Any]:
             try:
                 obj = read_json(f)
             except Exception:
+                unreadable.append(str(f.relative_to(sr)))
                 continue
             if obj.get("status") == "running":
                 running_operations.append({
@@ -271,6 +272,7 @@ def scan_state(sr: Path) -> dict[str, Any]:
         try:
             obj = read_json(f)
         except Exception:
+            unreadable.append(str(f.relative_to(sr)))
             continue
         if obj.get("run_id") and obj.get("status") == "running":
             running_validations.append({
@@ -285,6 +287,7 @@ def scan_state(sr: Path) -> dict[str, Any]:
             try:
                 obj = read_json(f)
             except Exception:
+                unreadable.append(str(f.relative_to(sr)))
                 continue
             if obj.get("status") == "running":
                 process_records_internal.append({
@@ -303,12 +306,26 @@ def scan_state(sr: Path) -> dict[str, Any]:
         "executor_pids": executor_pids(),
         "listener_pids": listener_pids(),
         "lease": public_lease(lease) if isinstance(lease, dict) else None,
-        "lease_error": lease_error,
+        "lease_error": lease_error or ("Unreadable operational records: " + ", ".join(unreadable[:4]) if unreadable else None),
         "incomplete_journals": incomplete_journals,
         "running_operations": running_operations,
         "running_validations": running_validations,
         "process_records": [{k: v for k, v in row.items() if k != "_path"} for row in process_records_internal],
     }
+
+def busy(s):
+    return bool((s.get("lease") or {}).get("active") or s.get("lease_error")
+                or any(s[k] for k in ("incomplete_journals","running_operations","running_validations","process_records")))
+
+def all_states():
+    base = state_root()
+    rows = [("LedgerForge", base)]
+    for path in sorted((base / "projects").glob("*")):
+        ident = read_json(path / "identity.json")
+        if hashlib.sha256(ident["project"].encode()).hexdigest() != path.name or path.is_symlink():
+            raise RecoveryError("Project-state identity mismatch")
+        rows.append((ident["project"], path))
+    return rows
 
 def ensure_executor_stopped() -> None:
     ep = executor_pids()
@@ -593,7 +610,7 @@ def restart_executor() -> dict[str, Any]:
     if not DESKTOP_LAUNCHER.is_file():
         raise RecoveryError(f"Desktop launcher missing: {DESKTOP_LAUNCHER}")
     p = subprocess.run(
-        ["/bin/zsh", str(DESKTOP_LAUNCHER), "start"],
+        [str(DESKTOP_LAUNCHER), "start"],
         capture_output=True, text=True, check=False, timeout=90,
     )
     if p.returncode != 0:
@@ -661,13 +678,9 @@ def self_test() -> None:
             globals()["executor_pids"] = lambda: []
             globals()["listener_pids"] = lambda: []
 
-            # The live launcher may spell the same executor through either the
-            # canonical checkout or its preserved compatibility symlink.  Only
-            # those two exact identities are accepted; arbitrary Python argv is not.
             canonical_cmd = f"/usr/bin/python3 {EXECUTOR_SOURCE}"
-            symlink_cmd = f"/usr/bin/python3 {Path.home() / 'ledgerforge-mcp-prototype' / 'executor_v2_1.py'}"
             assert executor_script_identity(canonical_cmd) == str(EXECUTOR_SOURCE)
-            assert executor_script_identity(symlink_cmd) == str(Path.home() / "ledgerforge-mcp-prototype" / "executor_v2_1.py")
+            assert executor_script_identity(f"/usr/bin/python3 -c {EXECUTOR_SOURCE}") is None
             assert executor_script_identity("/usr/bin/python3 /tmp/executor_v2_1.py") is None
             assert executor_script_identity("/usr/bin/python3 -c 'import executor_v2_1'") is None
 
@@ -776,7 +789,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Local-only owner/admin recovery for LedgerForge MCP leases.")
     ap.add_argument(
         "--state-root",
-        help="Exact production .executor-runs-v2_1-production-* root under ~/ledgerforge-mcp-prototype; "
+        help="Exact production .executor-runs-v2_1-production-* root under the installed MCP root; "
              "used only if the pointer file is unavailable or the owner deliberately targets a known production root.",
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -815,7 +828,12 @@ def main() -> int:
     sr = state_root(args.state_root)
 
     if args.cmd == "status":
-        print(json.dumps(scan_state(sr), indent=2, sort_keys=True))
+        status = scan_state(sr)
+        if not args.state_root:
+            others = {name:scan_state(path) for name,path in all_states() if path != sr}
+            status["project_states"] = others
+            status["busy_projects"] = [name for name, value in others.items() if busy(value)]
+        print(json.dumps(status, indent=2, sort_keys=True))
         return 0
 
     lock_handle = lock_admin()
@@ -844,6 +862,8 @@ def main() -> int:
                 if typed != lease_id:
                     raise RecoveryError("Confirmation mismatch; no recovery performed.")
 
+            if any(busy(scan_state(path)) for _,path in all_states() if path != sr):
+                raise RecoveryError("Another project has active work. Preserve the shared executor.")
             stop_result = stop_executor(
                 kill_after_timeout=args.kill_after_timeout,
                 all_exact=args.all_exact_executors,

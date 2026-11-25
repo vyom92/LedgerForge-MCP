@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import difflib
+import functools
+import importlib.util
+import typing
 import base64
 import secrets
 import fnmatch
@@ -49,21 +52,36 @@ except Exception:  # compatibility with older MCP SDKs
 # Configuration
 # ==========================================================================
 
-EXECUTOR_VERSION = "2.6.2"
-TOOLSET_REVISION = 9
-SCHEMA_CONTRACT_REVISION = "2.6.2"
-DEFAULT_REPO = Path("/Users/vyom/Applications/LedgerForge").resolve()
+EXECUTOR_VERSION = "3.0.0"
+TOOLSET_REVISION = 11
+SCHEMA_CONTRACT_REVISION = "3.0.0"
+PUBLICATION_POLICY_REVISION = "effect-aware-publication-v2"
 REPO_ROOT_ENV = "LEDGERFORGE_EXECUTOR_REPO_ROOT"
 EXPECTED_REMOTE_URL_ENV = "LEDGERFORGE_EXECUTOR_EXPECTED_REMOTE_URL"
 BRIDGE_ROOT_ENV = "LEDGERFORGE_EXECUTOR_BRIDGE_ROOT"
 MAINTENANCE_DESKTOP_ENV = "LEDGERFORGE_EXECUTOR_MAINTENANCE_DESKTOP"
 MAINTENANCE_TUNNEL_CONFIG_ENV = "LEDGERFORGE_EXECUTOR_MAINTENANCE_TUNNEL_CONFIG"
-REPO = Path(os.environ.get(REPO_ROOT_ENV, str(DEFAULT_REPO))).expanduser().resolve()
-BRIDGE_ROOT = Path(os.environ.get(BRIDGE_ROOT_ENV, str(Path.home() / "ledgerforge-mcp-prototype"))).expanduser().resolve()
-MAINTENANCE_DESKTOP = Path(os.environ.get(MAINTENANCE_DESKTOP_ENV, str(Path.home() / "Desktop"))).expanduser().resolve()
-MAINTENANCE_TUNNEL_CONFIG = Path(os.environ.get(MAINTENANCE_TUNNEL_CONFIG_ENV, str(Path.home() / ".config" / "tunnel-client"))).expanduser().resolve()
+# Each MCP call selects a project. A bound engine owns its paths, thread workers,
+# leases and evidence for its lifetime. No request changes process environment.
+INSTANCE_PROJECT = globals().get("_bound_project")
+BRIDGE_ROOT = Path(os.environ.get(BRIDGE_ROOT_ENV, Path(__file__).resolve().parent)).expanduser().resolve()
+WORKSPACE_ROOT = Path(os.environ.get("CHATGPT_MCP_WORKSPACE", BRIDGE_ROOT.parent)).expanduser().resolve()
+DEFAULT_REPO = Path(os.environ.get(REPO_ROOT_ENV, WORKSPACE_ROOT / "LedgerForge")).expanduser().resolve()
+REPO = INSTANCE_PROJECT or DEFAULT_REPO
+IS_LEDGERFORGE = REPO == DEFAULT_REPO
+IS_GIT = (REPO / ".git").exists()
+PROJECT_ID = REPO.relative_to(WORKSPACE_ROOT).as_posix()
+PROJECT_KEY = hashlib.sha256(PROJECT_ID.encode()).hexdigest()
+MAINTENANCE_DESKTOP = Path(os.environ.get(MAINTENANCE_DESKTOP_ENV, BRIDGE_ROOT)).resolve()
+MAINTENANCE_TUNNEL_CONFIG = Path(os.environ.get(MAINTENANCE_TUNNEL_CONFIG_ENV, Path.home() / ".config/tunnel-client")).resolve()
+
 DEFAULT_STATE_ROOT = (BRIDGE_ROOT / ".executor-runs-v2_1").resolve()
-_state_root_raw = os.environ.get("LEDGERFORGE_EXECUTOR_STATE_ROOT", str(DEFAULT_STATE_ROOT)).strip()
+pointer = BRIDGE_ROOT / ".executor-v2.1-state-root"
+_state_root_raw = os.environ.get("LEDGERFORGE_EXECUTOR_STATE_ROOT", "").strip()
+if not _state_root_raw:
+    if not pointer.is_file() or pointer.is_symlink():
+        raise RuntimeError("Production runtime-state pointer is unavailable.")
+    _state_root_raw = str(BRIDGE_ROOT / pointer.read_text().strip())
 RUNS = Path(_state_root_raw).expanduser().resolve()
 try:
     RUNS.relative_to(BRIDGE_ROOT)
@@ -71,6 +89,9 @@ except ValueError as exc:
     raise RuntimeError("LEDGERFORGE_EXECUTOR_STATE_ROOT must remain under the executor bridge root.") from exc
 if not RUNS.name.startswith(".executor-runs-v2_1"):
     raise RuntimeError("LEDGERFORGE_EXECUTOR_STATE_ROOT must use the .executor-runs-v2_1* namespace.")
+PRODUCTION_STATE = RUNS
+if INSTANCE_PROJECT is not None:
+    RUNS = PRODUCTION_STATE / "projects" / PROJECT_KEY
 OPERATIONS = RUNS / "operations"
 LEASES = RUNS / "leases"
 JOURNALS = RUNS / "journals"
@@ -122,6 +143,8 @@ PRIVATE_RESULT_FILE_ENV = "LEDGERFORGE_PRIVATE_RESULT_FILE"
 PRIVATE_RESULT_DOWNLOADS_PREFIX = ".ledgerforge-executor-private-result-"
 PRIVATE_RESULT_MARKER_NAME = ".ledgerforge-executor-private-result"
 TASK_WORKSPACE_ROOT = (BRIDGE_ROOT / ".executor-task-workspaces").resolve()
+if INSTANCE_PROJECT is not None:
+    TASK_WORKSPACE_ROOT = RUNS / "scratch"
 TASK_WORKSPACE_MARKER = ".mcp-task-workspace.json"
 TASK_WORKSPACE_TAINT_MARKER = ".mcp-private-source-taint.json"
 LOCAL_PROCESS_STATES = RUNS / "local-processes"
@@ -167,7 +190,7 @@ ValidationResultDetail = Literal["summary", "failures", "diagnostics", "private_
 MaintenanceInspectTarget = Literal["executor_source", "main_launcher", "owner_admin", "owner_wrapper", "owner_version", "static_qualifier", "isolated_qualifier", "release_activator", "release_version", "state_root_pointer", "executor_log", "tunnel_log"]
 MaintenanceInspectAction = Literal["stat", "hash", "read_bytes", "read_text"]
 MaintenanceReleaseAction = Literal["stage", "qualify", "status", "arm", "discard", "upload_chunk", "finalize_blob"]
-RootId = Literal["repo", "originals", "derived_data", "executor_artifacts", "ledgerforge_logs", "task_scratch"]
+RootId = Literal["repo", "workspace", "derived_data", "executor_artifacts", "ledgerforge_logs", "task_scratch"]
 ArtifactKind = Literal["auto", "metadata", "json", "plist", "xcresult", "sqlite"]
 GitInspectMode = Literal["state", "diff", "staged-diff", "log", "show", "blame"]
 PerformanceProbeKind = Literal["recent-validations", "built-app-size"]
@@ -227,6 +250,8 @@ ALL_TEST_ENV_KEYS = set(ALL_PRIVATE_ENV_KEYS) | {"LEDGERFORGE_TEST_HOST", PRIVAT
 SELECTOR_RE = re.compile(r"^[A-Za-z0-9_.:/-]+$")
 
 SECRET_EXACT_NAMES = {
+    ".executor-path", ".mcp-path", ".executor-secret-refs.json", "ledgerforge-runtime-key",
+    "ledgerforge-admin-auth-header", "ledgerforge-recovery.yaml", "ledgerforge-recovery-admin.yaml",
     ".executor-token",
     ".executor-admin-token",
     ".executor-auth-header",
@@ -251,7 +276,7 @@ MAINTENANCE_BLOB_ROOT = MAINTENANCE_ROOT / "blobs"
 for _directory in (MAINTENANCE_ROOT, PREPARED_RELEASE_ROOT, MAINTENANCE_OPERATIONS, MAINTENANCE_BLOB_ROOT):
     _directory.mkdir(parents=True, exist_ok=True)
     os.chmod(_directory, 0o700)
-EXECUTOR_BOOT_ID = str(uuid.uuid4())
+EXECUTOR_BOOT_ID = globals().get("_bound_boot") or str(uuid.uuid4())
 
 _file_lock = threading.Lock()
 _state_lock = threading.Lock()
@@ -282,11 +307,10 @@ def sha256_text(text: str) -> str:
     return sha256_bytes(text.encode("utf-8"))
 
 
+LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
 def source_sha256() -> str:
-    try:
-        return sha256_bytes(Path(__file__).read_bytes())
-    except Exception:
-        return "unavailable"
+    return LOADED_SOURCE_SHA256
 
 
 def truncate_text(text: str, max_bytes: int) -> tuple[str, bool]:
@@ -321,7 +345,7 @@ def current_secret_values() -> list[str]:
     # Keep credential redaction narrow. Private source paths and ordinary test-host
     # environment values are local development metadata, not credentials.
     values: list[str] = []
-    for key in (BEARER_TOKEN_ENV, ADMIN_BEARER_TOKEN_ENV, "LEDGERFORGE_AXIS_CARD_PRIVATE_PASSWORD"):
+    for key in (BEARER_TOKEN_ENV, ADMIN_BEARER_TOKEN_ENV, MCP_PATH_ENV, "LEDGERFORGE_AXIS_CARD_PRIVATE_PASSWORD"):
         value = os.environ.get(key, "")
         if value:
             values.append(value)
@@ -448,6 +472,7 @@ CORE_FEATURES = {
     "private-source-taint-enforcement",
     "repository-process-effect-bounds",
     "extended-durable-waits",
+    "publication-candidate-adoption",
 }
 
 EVIDENCE_FEATURES = {
@@ -478,6 +503,7 @@ OPTIONAL_FEATURES = {
 }
 
 TOOL_ANNOTATION_CONTRACT: dict[str, dict[str, bool]] = {
+    "workspace_projects": {"read_only": True, "destructive": False, "idempotent": True, "open_world": False},
     "executor_capabilities": {"read_only": True, "destructive": False, "idempotent": False, "open_world": False},
     "host_status": {"read_only": True, "destructive": False, "idempotent": False, "open_world": False},
     "workspace_state": {"read_only": True, "destructive": False, "idempotent": False, "open_world": False},
@@ -508,6 +534,7 @@ TOOL_ANNOTATION_CONTRACT: dict[str, dict[str, bool]] = {
     "git_fetch_origin": {"read_only": False, "destructive": False, "idempotent": True, "open_world": True},
     "git_stage": {"read_only": False, "destructive": True, "idempotent": True, "open_world": False},
     "git_commit": {"read_only": False, "destructive": False, "idempotent": True, "open_world": False},
+    "adopt_publication_candidate": {"read_only": False, "destructive": False, "idempotent": True, "open_world": True},
     "git_push": {"read_only": False, "destructive": False, "idempotent": True, "open_world": True},
     "run_repo_task": {"read_only": False, "destructive": False, "idempotent": True, "open_world": False},
     "start_validation": {"read_only": False, "destructive": False, "idempotent": True, "open_world": False},
@@ -655,15 +682,37 @@ def axis_keychain_available() -> bool:
     return result.returncode == 0
 
 
+def gmail_attachment(context):
+    """An owner-supplied temporary Gmail download. No mailbox access or archive discovery."""
+    descriptor = BRIDGE_ROOT / ".mcp-maintenance" / "gmail-attachment.json"
+    if not IS_LEDGERFORGE or not descriptor.is_file() or descriptor.is_symlink():
+        return None
+    try:
+        spec = json.loads(descriptor.read_text())
+        if (spec.get("context") != context or not all(isinstance(spec.get(k), str) and spec[k].strip()
+                for k in ("gmail_message_id","gmail_attachment_id","sha256","path"))):
+            return None
+        path = Path(spec["path"])
+        if not path.is_absolute() or path.resolve() != path or path.is_relative_to(WORKSPACE_ROOT) or not path.is_file():
+            return None
+        # Directory-based native tests may only see this one supplied attachment.
+        if any(p != path and not p.name.startswith(".") for p in path.parent.iterdir()):
+            return None
+        if _sha256_file_stream(path)[0] != spec["sha256"]:
+            return None
+        return spec
+    except (OSError, ValueError, TypeError):
+        return None
+
 def private_context_available(name: str) -> bool:
     if name not in PRIVATE_CONTEXTS:
+        return False
+    if not gmail_attachment(name):
         return False
     for key in PRIVATE_CONTEXTS[name]:
         if key == "LEDGERFORGE_AXIS_CARD_PRIVATE_PASSWORD":
             if not axis_keychain_available():
                 return False
-        elif not os.environ.get(key, ""):
-            return False
     return True
 
 
@@ -688,10 +737,35 @@ def lease_is_expired(lease: dict[str, Any]) -> bool:
         return True
 
 
+def public_publication_candidate_view(candidate: dict[str, Any] | None) -> dict[str, Any]:
+    """Expose only non-secret candidate identity needed after a restart."""
+    if not isinstance(candidate, dict):
+        return {"present": False}
+    return {
+        "present": True,
+        "schema": candidate.get("schema"),
+        "source": candidate.get("source"),
+        "previous_head": candidate.get("previous_head"),
+        "parent_head": candidate.get("parent_head"),
+        "commit_head": candidate.get("commit_head"),
+        "tree_sha": candidate.get("tree_sha"),
+        "expected_origin_main": candidate.get("expected_origin_main"),
+        "fresh_origin_main": candidate.get("fresh_origin_main"),
+        "validation_run_id": candidate.get("validation_run_id"),
+        "candidate_worktree_fingerprint": candidate.get("candidate_worktree_fingerprint"),
+        "candidate_index_fingerprint": candidate.get("candidate_index_fingerprint"),
+        "committed_path_count": len(candidate.get("committed_paths", [])) if isinstance(candidate.get("committed_paths"), list) else None,
+        "committed_paths_source": candidate.get("committed_paths_source"),
+        "created_at": candidate.get("created_at"),
+        "adopted_at": candidate.get("adopted_at"),
+    }
+
+
 def public_lease_view(lease: dict[str, Any] | None) -> dict[str, Any]:
     if not lease:
         return {"active": False}
     return {
+        "project": lease.get("project", PROJECT_ID),
         "active": not lease_is_expired(lease) and lease.get("status") == "active",
         "lease_id": lease.get("lease_id"),
         "execution_id": lease.get("execution_id"),
@@ -706,6 +780,9 @@ def public_lease_view(lease: dict[str, Any] | None) -> dict[str, Any]:
         "sequence": lease.get("sequence"),
         "executor_boot_id": lease.get("executor_boot_id"),
         "status": lease.get("status"),
+        "publication_candidate": public_publication_candidate_view(lease.get("publication_candidate")),
+        "publication_candidate_invalidated_at": lease.get("publication_candidate_invalidated_at"),
+        "publication_candidate_invalidated_reason": lease.get("publication_candidate_invalidated_reason"),
         "token_exposed": False,
     }
 
@@ -799,6 +876,13 @@ def mark_lease_validation_state(lease_id: str, lease_token: str, *, run_id: str,
         lease = read_active_lease_raw() or lease
         lease["active_validation_run_id"] = run_id if starting else None
         lease["validation_state_at"] = now_iso()
+        if starting and lease.get("publication_candidate") is not None:
+            # A candidate is only valid for the exact state that produced it. A
+            # subsequent validation is a new authorization boundary; clear the
+            # old candidate before the run can change or re-bind validation state.
+            lease["publication_candidate"] = None
+            lease["publication_candidate_invalidated_at"] = now_iso()
+            lease["publication_candidate_invalidated_reason"] = "validation started after publication candidate creation"
         atomic_write_json(LEASE_FILE, lease)
         return lease
 
@@ -811,6 +895,10 @@ def invalidate_lease_validation_binding(lease: dict[str, Any], reason: str) -> N
         current["validated_state"] = None
         current["validation_invalidated_at"] = now_iso()
         current["validation_invalidated_reason"] = reason
+        if current.get("publication_candidate") is not None:
+            current["publication_candidate"] = None
+            current["publication_candidate_invalidated_at"] = now_iso()
+            current["publication_candidate_invalidated_reason"] = reason
         atomic_write_json(LEASE_FILE, current)
 
 
@@ -820,28 +908,33 @@ def bind_validated_state(lease_id: str, lease_token: str, run_id: str, state: di
         lease = read_active_lease_raw() or lease
         lease["validated_state"] = {
             "run_id": run_id,
+        "project": PROJECT_ID,
             "head": state.get("ending_head"),
             "worktree_fingerprint": state.get("ending_worktree_fingerprint") or worktree_fingerprint(),
             "index_fingerprint": state.get("ending_index_fingerprint") or index_fingerprint(),
             "exit_code": state.get("exit_code"),
             "repository_mutated": state.get("repository_mutated"),
             "failure_classification": state.get("failure_classification"),
+            "operation": state.get("operation"),
             "validation_intent": state.get("validation_intent"),
             "publication_eligible": state.get("publication_eligible", True),
+            "build_artifact_evidence": ((state.get("safe_test_summary") or {}).get("build_artifact_evidence") if isinstance(state.get("safe_test_summary"), dict) else None),
             "bound_at": now_iso(),
         }
         lease["active_validation_run_id"] = None
         atomic_write_json(LEASE_FILE, lease)
 
 
-def validate_bound_state_for_publication(lease: dict[str, Any], *, require_success: bool = True) -> dict[str, Any]:
+def validate_bound_state_for_publication(
+    lease: dict[str, Any], *, require_success: bool = True,
+    paths: list[str] | None = None, parent_head: str | None = None, commit_head: str | None = None,
+) -> dict[str, Any]:
+    """Validate durable state binding; effect eligibility is mechanically derived from changed paths."""
     bound = lease.get("validated_state")
     if not isinstance(bound, dict):
         raise RuntimeError("No validation state is bound to this execution lease.")
     if require_success and bound.get("exit_code") != 0:
         raise RuntimeError("Bound validation did not succeed.")
-    if require_success and bound.get("publication_eligible") is False:
-        raise RuntimeError("Bound validation is compile-only and cannot authorize publication.")
     if bound.get("repository_mutated"):
         raise RuntimeError("Bound validation reported repository mutation.")
     if bound.get("head") != resolve_ref("HEAD"):
@@ -853,7 +946,13 @@ def validate_bound_state_for_publication(lease: dict[str, Any], *, require_succe
             f"bound_fingerprint={bound.get('worktree_fingerprint')} "
             f"current_fingerprint={current_worktree_fingerprint}"
         )
-    return bound
+    result = dict(bound)
+    if paths is not None:
+        policy = evaluate_publication_eligibility(paths, bound, parent_head=parent_head, commit_head=commit_head)
+        result["publication_policy"] = policy
+        if require_success and not policy["publication_eligible"]:
+            raise RuntimeError("Publication eligibility denied: " + policy["reason"])
+    return result
 
 
 def process_record_path(run_id: str) -> Path:
@@ -863,6 +962,7 @@ def process_record_path(run_id: str) -> Path:
 def write_process_record(run_id: str, proc: subprocess.Popen[str], command_class: str) -> None:
     record = {
         "run_id": run_id,
+        "project": PROJECT_ID,
         "pid": proc.pid,
         "pgid": proc.pid,
         "command_class": command_class,
@@ -1172,30 +1272,11 @@ def startup_reconcile() -> dict[str, Any]:
                     pass
             report["incomplete_journals"].append(root.name)
     temp_base = Path(os.environ.get("TMPDIR") or "/tmp")
-    for candidate in temp_base.glob("ledgerforge-executor-v*-*-private"):
+    for candidate in (temp_base.glob("ledgerforge-executor-v*-*-private") if IS_LEDGERFORGE else ()):
         if not candidate.is_dir():
             continue
         marker = candidate / ".ledgerforge-executor-private-artifact"
         if marker.is_file():
-            try:
-                shutil.rmtree(candidate)
-                report["stale_private_artifacts_removed"] += 1
-            except Exception:
-                pass
-    downloads_base = (Path.home() / "Downloads").resolve()
-    if downloads_base.is_dir():
-        for candidate in downloads_base.glob(f"{PRIVATE_RESULT_DOWNLOADS_PREFIX}*-private-result"):
-            if not candidate.is_dir() or candidate.is_symlink():
-                continue
-            marker = candidate / PRIVATE_RESULT_MARKER_NAME
-            if not marker.is_file() or marker.is_symlink():
-                continue
-            try:
-                metadata = json.loads(marker.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if metadata.get("kind") != "private_result_v1":
-                continue
             try:
                 shutil.rmtree(candidate)
                 report["stale_private_artifacts_removed"] += 1
@@ -1225,7 +1306,9 @@ def startup_reconcile() -> dict[str, Any]:
 # ==========================================================================
 
 def git_env(mutating: bool = False) -> dict[str, str]:
-    env = os.environ.copy()
+    env = {k:v for k,v in os.environ.items() if k not in {BEARER_TOKEN_ENV, ADMIN_BEARER_TOKEN_ENV, MCP_PATH_ENV} and k not in ALL_PRIVATE_ENV_KEYS}
+    env.update(GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0="/dev/null",
+               GIT_CONFIG_KEY_1="core.fsmonitor", GIT_CONFIG_VALUE_1="false")
     if not mutating:
         env["GIT_OPTIONAL_LOCKS"] = "0"
     else:
@@ -1261,6 +1344,8 @@ def run_git(
 
 
 def resolve_ref(name: str) -> str | None:
+    if not IS_GIT:
+        return "directory-" + PROJECT_KEY if name == "HEAD" else None
     result = subprocess.run(
         ["git", "-C", str(REPO), "rev-parse", "--verify", name],
         capture_output=True,
@@ -1276,13 +1361,14 @@ def resolve_ref(name: str) -> str | None:
 
 
 def require_expected_head(expected_head: str) -> str:
-    actual = resolve_ref("HEAD")
+    actual = resolve_ref("HEAD") or "unborn-" + PROJECT_KEY
     if actual != expected_head:
         raise RuntimeError(f"HEAD changed. Expected={expected_head}, actual={actual}")
     return actual
 
 
 def git_status_raw() -> str:
+    if not IS_GIT: return worktree_fingerprint()
     result = subprocess.run(
         ["git", "-C", str(REPO), "status", "--porcelain=v2", "--branch", "--untracked-files=all", "-z"],
         capture_output=True,
@@ -1295,6 +1381,7 @@ def git_status_raw() -> str:
 
 
 def git_worktree_status_raw() -> str:
+    if not IS_GIT: return worktree_fingerprint()
     result = subprocess.run(
         ["git", "-C", str(REPO), "status", "--porcelain=v2", "--untracked-files=all", "-z"],
         capture_output=True,
@@ -1316,29 +1403,41 @@ def path_set_from_git(*args: str) -> set[str]:
 
 
 def tracked_paths() -> set[str]:
+    if not IS_GIT: return set()
     return path_set_from_git("ls-files", "--cached")
 
 
 def untracked_paths() -> set[str]:
+    if not IS_GIT:
+        result = set()
+        for base, dirs, files in os.walk(REPO, followlinks=False):
+            here = Path(base)
+            dirs[:] = [d for d in dirs if walk_allowed("repo", REPO, here / d)]
+            result.update((here / f).relative_to(REPO).as_posix() for f in files if walk_allowed("repo", REPO, here / f))
+        return result
     return path_set_from_git("ls-files", "--others", "--exclude-standard")
 
 
 def changed_tracked_paths() -> list[str]:
+    if not IS_GIT or not resolve_ref("HEAD"): return []
     raw = run_git("diff", "--name-only", "--no-renames", "-z", "HEAD", "--", strip=False)
     return sorted({item for item in raw.split("\0") if item})
 
 
 def staged_paths() -> list[str]:
+    if not IS_GIT: return []
     raw = run_git("diff", "--cached", "--name-only", "--no-renames", "-z", "--", strip=False)
     return sorted({item for item in raw.split("\0") if item})
 
 
 def conflicted_paths() -> list[str]:
+    if not IS_GIT: return []
     raw = run_git("diff", "--name-only", "--diff-filter=U", "-z", strip=False)
     return sorted({item for item in raw.split("\0") if item})
 
 
 def active_git_operation() -> str | None:
+    if not IS_GIT: return None
     checks = (
         ("MERGE_HEAD", "merge"),
         ("CHERRY_PICK_HEAD", "cherry-pick"),
@@ -1393,6 +1492,7 @@ def current_path_identity(relative: str) -> str:
 def worktree_fingerprint() -> str:
     changed = sorted(set(changed_tracked_paths()) | set(untracked_paths()) | set(conflicted_paths()))
     payload: list[str] = [
+        "PROJECT=" + PROJECT_ID,
         f"HEAD={resolve_ref('HEAD')}",
         "CHANGED_PATHS=" + json.dumps(changed, separators=(",", ":")),
     ]
@@ -1403,9 +1503,10 @@ def worktree_fingerprint() -> str:
 
 
 def index_fingerprint() -> str:
+    if not IS_GIT: return sha256_text("no-index:" + PROJECT_ID)
     cached = run_git("diff", "--cached", "--binary", "--no-ext-diff", "--no-renames", "--", strip=False)
     listing = run_git("ls-files", "-s", "-z", strip=False)
-    return sha256_text(cached + "\n" + listing)
+    return sha256_text(PROJECT_ID + "\n" + cached + "\n" + listing)
 
 
 def require_worktree_fingerprint(expected: str) -> str:
@@ -1456,6 +1557,18 @@ def canonical_github_repository(raw: str) -> tuple[str, str, str] | None:
     return host, parts[0], parts[1]
 
 
+def safe_publication_remote(raw):
+    if raw.startswith("git@") and re.fullmatch(r"git@[A-Za-z0-9.-]+:[A-Za-z0-9_./-]+", raw):
+        return True
+    url = urlsplit(raw)
+    if url.scheme in {"https","ssh"}:
+        return bool(url.hostname and not url.password and (not url.username or url.username == "git"))
+    return Path(raw).is_absolute() and Path(raw).resolve().is_relative_to(WORKSPACE_ROOT)
+
+def origin_digest():
+    result = subprocess.run(["/usr/bin/git","-C",str(REPO),"remote","get-url","origin"], capture_output=True,text=True,env=git_env())
+    return hashlib.sha256(result.stdout.strip().encode()).hexdigest() if result.returncode == 0 else None
+
 def require_expected_origin_identity() -> str:
     result = subprocess.run(
         ["git", "-C", str(REPO), "remote", "get-url", "origin"],
@@ -1464,28 +1577,59 @@ def require_expected_origin_identity() -> str:
     if result.returncode != 0 or not result.stdout.strip():
         raise RuntimeError("origin remote is unavailable.")
     raw = result.stdout.strip()
-    override = os.environ.get(EXPECTED_REMOTE_URL_ENV, "").strip()
+    override = os.environ.get(EXPECTED_REMOTE_URL_ENV, "").strip() if IS_LEDGERFORGE else ""
     if override:
         if raw != override:
             raise RuntimeError(f"origin does not match explicit executor expected remote: {safe_remote_url(raw)}")
         return safe_remote_url(raw)
+    if not IS_LEDGERFORGE:
+        lease = read_active_lease_raw() or {}
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        push = run_git("remote", "get-url", "--push", "--all", "origin")
+        if lease.get("publication_branch") != publication_branch() or lease.get("origin_digest") != digest or push != raw or not safe_publication_remote(raw):
+            raise RuntimeError("Origin or push destination differs from the project lease.")
+        return safe_remote_url(raw)
+    if run_git("remote","get-url","--push","--all","origin") != raw:
+        raise RuntimeError("The Git push URL must match the verified origin.")
     canonical = canonical_github_repository(raw)
     if canonical != ("github.com", "vyom92", "LedgerForge"):
         raise RuntimeError(f"origin does not canonically identify github.com/vyom92/LedgerForge: {safe_remote_url(raw)}")
     return safe_remote_url(raw)
 
 
+def publication_branch():
+    if IS_LEDGERFORGE:
+        return "main"
+    # Prefer the tracked default branch. Without a remote HEAD use the current branch.
+    rem = subprocess.run(["/usr/bin/git","-C",str(REPO),"symbolic-ref","--quiet","--short","refs/remotes/origin/HEAD"],
+                         capture_output=True,text=True,env=git_env())
+    target = rem.stdout.strip().removeprefix("origin/") if rem.returncode==0 else run_git("branch","--show-current")
+    if not target or target.startswith("-") or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*",target):
+        raise RuntimeError("Select a checked-out publication branch with an unambiguous origin.")
+    return target
+
+def publication_tracking_ref():
+    return "origin/" + publication_branch()
+
 def workspace_snapshot() -> dict[str, Any]:
+    if not IS_GIT:
+        return {"project": PROJECT_ID, "directory": str(REPO), "kind": "directory",
+                "head": None, "mutation_baseline": resolve_ref("HEAD"),
+                "worktree_fingerprint": worktree_fingerprint(), "index_fingerprint": index_fingerprint()}
     head = resolve_ref("HEAD")
-    main = resolve_ref("main")
-    origin_main = resolve_ref("origin/main")
+    main = resolve_ref(publication_branch())
+    origin_main = resolve_ref(publication_tracking_ref())
     ahead = behind = None
     if main and origin_main:
-        counts = run_git("rev-list", "--left-right", "--count", "main...origin/main").split()
+        counts = run_git("rev-list", "--left-right", "--count", f"{publication_branch()}...{publication_tracking_ref()}").split()
         if len(counts) == 2:
             ahead, behind = int(counts[0]), int(counts[1])
     return {
+        "project": PROJECT_ID,
         "repository_root": str(REPO),
+        "publication_branch": publication_branch(),
+        "tracking_ref": publication_tracking_ref(),
+        "mutation_baseline": head or "unborn-" + PROJECT_KEY,
         "current_branch": run_git("branch", "--show-current") or None,
         "head": head,
         "main": main,
@@ -1506,19 +1650,11 @@ def workspace_snapshot() -> dict[str, Any]:
         "stashes": run_git("stash", "list", "--format=%gd\t%H\t%gs"),
         "remote_origin": remote_identity(),
         "notes": [
-            "origin/main is locally recorded unless git_fetch_origin has just run.",
+            "The tracking ref is locally recorded unless git_fetch_origin has just run.",
             "No implicit fetch occurs in workspace_state.",
         ],
     }
 
-
-if not REPO.is_dir():
-    raise RuntimeError(f"LedgerForge repository does not exist: {REPO}")
-actual_root = Path(run_git("rev-parse", "--show-toplevel", sanitize=False)).resolve()
-if actual_root != REPO:
-    raise RuntimeError(f"Configured path is not the Git worktree root: {actual_root}")
-if not VALIDATE_SCRIPT.is_file():
-    raise RuntimeError(f"Repository validation script missing: {VALIDATE_SCRIPT}")
 
 
 # ==========================================================================
@@ -1528,13 +1664,39 @@ if not VALIDATE_SCRIPT.is_file():
 def root_registry() -> dict[str, Path]:
     return {
         "repo": REPO,
-        "originals": (Path.home() / "Documents" / "Ledger Forge" / "Originals").resolve(),
-        "derived_data": (Path.home() / "Library" / "Developer" / "Xcode" / "DerivedData").resolve(),
-        "executor_artifacts": BRIDGE_ROOT.resolve(),
+        "workspace": WORKSPACE_ROOT,
+        **({"derived_data": (Path.home() / "Library" / "Developer" / "Xcode" / "DerivedData").resolve()} if IS_LEDGERFORGE else {}),
+        "executor_artifacts": RUNS,
         "ledgerforge_logs": (Path.home() / ".config" / "tunnel-client").resolve(),
         "task_scratch": TASK_WORKSPACE_ROOT,
     }
 
+
+def check_project_path(root_id, root, supplied, writing=False):
+    if supplied.is_absolute() or any(x in {"..", ".git"} for x in supplied.parts):
+        raise PermissionError("Traversal and Git internals are excluded.")
+    current = root
+    for part in supplied.parts:
+        current /= part
+        if current.is_symlink() or is_secret_name(current):
+            raise PermissionError("Symbolic links and credential paths are excluded.")
+        if root_id in {"repo", "workspace"}:
+            if current == BRIDGE_ROOT or current.is_relative_to(BRIDGE_ROOT):
+                if writing or root_id == "workspace" or root != BRIDGE_ROOT or not current.is_file() or current.relative_to(root).as_posix() not in tracked_paths():
+                    raise PermissionError("Use maintenance to inspect installation internals.")
+            if root_id == "repo" and ((current / ".git").exists() or (root == WORKSPACE_ROOT and current.parent == root and current.is_dir())):
+                raise PermissionError("Select the nested repository explicitly.")
+    if root_id == "executor_artifacts" and supplied.parts and supplied.parts[0] in {"projects","leases","operations","journals"}:
+        raise PermissionError("Use the project-scoped evidence or lease tool for this record.")
+    if root_id == "ledgerforge_logs" and supplied.parts and (len(supplied.parts)!=1 or supplied.suffix != ".log"):
+        raise PermissionError("Only diagnostic log files are available here.")
+
+def walk_allowed(root_id, root, candidate):
+    try:
+        check_project_path(root_id, root, candidate.relative_to(root))
+        return True
+    except (PermissionError, ValueError, OSError):
+        return False
 
 def normalize_root_path(root_id: str, path: str, *, allow_root: bool = False) -> tuple[str, Path, Path]:
     roots = root_registry()
@@ -1546,6 +1708,7 @@ def normalize_root_path(root_id: str, path: str, *, allow_root: bool = False) ->
     supplied = Path(path or ".")
     if supplied.is_absolute():
         raise PermissionError("Absolute caller paths are not accepted.")
+    check_project_path(root_id, root, supplied)
     candidate = (root / supplied).resolve(strict=False)
     try:
         relative = candidate.relative_to(root)
@@ -1579,6 +1742,7 @@ def normalize_repo_write_path(path: str, *, allow_root: bool = False) -> tuple[s
         raise PermissionError("Absolute write paths are not accepted.")
     if any(part in {"..", ".git"} for part in supplied.parts):
         raise PermissionError("Traversal and .git paths are forbidden.")
+    check_project_path("repo", REPO, supplied, writing=True)
     candidate = (REPO / supplied).resolve(strict=False)
     try:
         relative = candidate.relative_to(REPO)
@@ -1685,6 +1849,7 @@ def begin_operation(operation_id: str, action: str, payload: dict[str, Any]) -> 
                 "executor_source_sha256": source_sha256(),
                 "schema_contract_sha256": schema_contract_digest(),
                 "lease_id": lease_id,
+                "project": PROJECT_ID,
                 "execution_id": active_lease.get("execution_id") if active_lease else None,
                 "authorization_digest": active_lease.get("authorization_digest") if active_lease else None,
                 "provenance_label": normalize_provenance_label(payload.get("provenance_label")),
@@ -1760,6 +1925,9 @@ def resolve_private_context(private_context: str | None) -> tuple[dict[str, str]
         return validation_env, None, [], {}
     if private_context not in PRIVATE_CONTEXTS:
         raise PermissionError(f"Unsupported private_context: {private_context}")
+    attachment = gmail_attachment(private_context)
+    if not attachment:
+        raise RuntimeError("Source-dependent validation unavailable. Supply the original Gmail attachment and its provenance.")
     required = PRIVATE_CONTEXTS[private_context]
     values: dict[str, str] = {}
     redacted: list[str] = []
@@ -1767,7 +1935,7 @@ def resolve_private_context(private_context: str | None) -> tuple[dict[str, str]
         if key == "LEDGERFORGE_AXIS_CARD_PRIVATE_PASSWORD":
             value = keychain_axis_password()
         else:
-            value = os.environ.get(key, "")
+            value = str(Path(attachment["path"]).parent)
         if not value:
             raise RuntimeError(f"Private context {private_context} is not fully configured.")
         values[key] = value
@@ -1775,14 +1943,8 @@ def resolve_private_context(private_context: str | None) -> tuple[dict[str, str]
         if key == "LEDGERFORGE_AXIS_CARD_PRIVATE_PASSWORD":
             redacted.append(value)
     if private_context == "hdfc":
-        for key in (
-            "LEDGERFORGE_PRIVATE_HDFC_ORACLE_FILE",
-            "LEDGERFORGE_PRIVATE_HDFC_ORIGINALS_FILE",
-        ):
-            value = os.environ.get(key, "")
-            if value:
-                values[key] = value
-                validation_env[key] = value
+        values["LEDGERFORGE_PRIVATE_HDFC_ORIGINALS_FILE"] = attachment["path"]
+        validation_env.update(values)
     validation_env["LEDGERFORGE_TEST_HOST"] = "1"
     values["LEDGERFORGE_TEST_HOST"] = "1"
     return validation_env, private_context, redacted, values
@@ -2167,8 +2329,24 @@ def private_result_downloads_base() -> Path:
     return base
 
 
+def remove_abandoned_private_results(base: Path) -> None:
+    # The Downloads entitlement is needed only when a private result is requested.
+    # The result directory is identified by its own marker and previous executor boot.
+    for candidate in base.glob(f"{PRIVATE_RESULT_DOWNLOADS_PREFIX}*-private-result"):
+        marker = candidate / PRIVATE_RESULT_MARKER_NAME
+        if candidate.is_symlink() or marker.is_symlink() or not marker.is_file():
+            continue
+        try:
+            metadata = json.loads(marker.read_text(encoding="utf-8"))
+            if metadata.get("kind") == "private_result_v1" and metadata.get("boot_id") != EXECUTOR_BOOT_ID:
+                shutil.rmtree(candidate)
+        except (OSError, ValueError):
+            continue
+
+
 def create_private_result_artifact_root(run_id: str) -> Path:
     base = private_result_downloads_base()
+    remove_abandoned_private_results(base)
     root = Path(tempfile.mkdtemp(
         prefix=f"{PRIVATE_RESULT_DOWNLOADS_PREFIX}{run_id}-",
         suffix="-private-result",
@@ -2180,6 +2358,7 @@ def create_private_result_artifact_root(run_id: str) -> Path:
         marker.write_text(json.dumps({
             "kind": "private_result_v1",
             "run_id": run_id,
+        "project": PROJECT_ID,
             "boot_id": EXECUTOR_BOOT_ID,
         }, sort_keys=True), encoding="utf-8")
         marker.chmod(0o600)
@@ -2359,13 +2538,92 @@ def execute_validation(
     validation_intent: ValidationIntent,
     private_result_contract: PrivateResultContract | None = None,
 ) -> tuple[int, str, dict[str, Any]]:
-    command = [str(VALIDATE_SCRIPT), operation, *selectors]
+    if not IS_LEDGERFORGE:
+        if requested_values or selectors or operation not in {"test-full","build-debug","build-release"}:
+            raise ValueError("This project supports its native full test or build entry point.")
+        task = "test" if operation == "test-full" else "build"
+        script = REPO / "script" / (task + ".sh")
+        if script.is_file() and not script.is_symlink() and script.resolve().is_relative_to(REPO):
+            argv = ["/bin/sh", str(script)]
+        elif (REPO / "Package.swift").is_file():
+            argv = ["/usr/bin/swift", task, "--scratch-path", str(RUNS / run_id / "build")]
+        elif (REPO / "Makefile").is_file():
+            argv = ["/usr/bin/make", task]
+        elif task == "test" and (REPO / "tests").is_dir():
+            argv = [sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests"]
+        else:
+            raise RuntimeError("No project test/build entry point found (script/test.sh, script/build.sh, SwiftPM, Makefile, or Python tests).")
+        scratch = RUNS / run_id / "validation-work"
+        scratch.mkdir(parents=True, exist_ok=True)
+        for n in ("tmp","home"): (scratch/n).mkdir(exist_ok=True)
+        profile = _sandbox_profile(scratch, "repository") + f'(deny file-write* (subpath "{_sandbox_escape(REPO)}"))\n'
+        if argv[0] == sys.executable:
+            profile += f'(allow file-read* (subpath "{_sandbox_escape(Path(sys.prefix))}"))\n'
+        status, output = run_captured(["/usr/bin/sandbox-exec","-p",profile,*argv],
+                    _safe_local_process_base_env(scratch), run_id=run_id, command_class="repo-task")
+        if task == "test" and "-m" in argv and "Ran 0 tests" in output:
+            return 1, output, {"reason":"No tests executed"}
+        return status, output, {"project": PROJECT_ID, "entrypoint": argv[0], "task": task}
+    command = ["/bin/bash", str(VALIDATE_SCRIPT), operation, *selectors]
     if operation in {"test-focused", "test-full", "cycle-close"}:
         return run_private_xcode_test_validation(
             run_id, operation, selectors, validation_env, requested_values, validation_intent, private_result_contract
         )
     status, output = run_captured(command, validation_env, run_id=run_id)
     return status, output, {}
+
+
+def _build_artifact_evidence(operation: str, raw_output: str) -> dict[str, Any] | None:
+    if operation not in {"build-debug", "build-release"}:
+        return None
+    matches = re.findall(r"(?m)^DerivedData:\s*(.+?)\s*$", raw_output)
+    if len(matches) != 1:
+        return {"schema": "build-artifact-evidence-v1", "pass": False, "reason": "derived-data-identity-not-unique"}
+    try:
+        derived = Path(matches[0]).expanduser().resolve(strict=True)
+        derived.relative_to(Path(tempfile.gettempdir()).resolve())
+    except Exception:
+        return {"schema": "build-artifact-evidence-v1", "pass": False, "reason": "derived-data-outside-task-temp"}
+    config = "Debug" if operation == "build-debug" else "Release"
+    app = derived / "Build" / "Products" / config / "LedgerForge.app"
+    if app.is_symlink() or not app.is_dir():
+        return {"schema": "build-artifact-evidence-v1", "pass": False, "reason": "expected-app-bundle-missing", "configuration": config}
+    executable = app / "Contents" / "MacOS" / "LedgerForge"
+    if executable.is_symlink() or not executable.is_file():
+        return {"schema": "build-artifact-evidence-v1", "pass": False, "reason": "bundle-executable-missing", "configuration": config}
+    resources = app / "Contents" / "Resources"
+    rows: list[dict[str, Any]] = []
+    if resources.exists():
+        if resources.is_symlink() or not resources.is_dir():
+            return {"schema": "build-artifact-evidence-v1", "pass": False, "reason": "resources-root-unsafe", "configuration": config}
+        candidates = sorted(resources.rglob("*"), key=lambda item: item.as_posix())
+        if len(candidates) > 5000:
+            return {"schema": "build-artifact-evidence-v1", "pass": False, "reason": "resource-count-exceeded", "configuration": config}
+        for item in candidates:
+            if item.is_symlink():
+                return {"schema": "build-artifact-evidence-v1", "pass": False, "reason": "resource-symlink-ambiguous", "configuration": config}
+            if item.is_dir():
+                continue
+            if not item.is_file():
+                return {"schema": "build-artifact-evidence-v1", "pass": False, "reason": "resource-entry-not-file", "configuration": config}
+            rel = item.relative_to(resources).as_posix()
+            digest, size = _sha256_file_stream(item)
+            rows.append({"path": rel, "size": size, "sha256": digest})
+    canonical = json.dumps(rows, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    executable_sha, executable_size = _sha256_file_stream(executable)
+    return {
+        "schema": "build-artifact-evidence-v1",
+        "pass": True,
+        "configuration": config,
+        "bundle_name": "LedgerForge.app",
+        "bundle_executable_sha256": executable_sha,
+        "bundle_executable_size": executable_size,
+        "resource_file_count": len(rows),
+        "resource_paths": [row["path"] for row in rows],
+        "resource_manifest": rows,
+        "resource_manifest_sha256": sha256_text(canonical),
+        "evidence_digest": sha256_text(json.dumps({"configuration": config, "executable": executable_sha, "resources": rows}, sort_keys=True, separators=(",", ":"))),
+    }
 
 
 def validation_worker(
@@ -2391,11 +2649,14 @@ def validation_worker(
         )
         private_build_diagnostics = safe_summary.pop("_private_build_diagnostics", None)
         private_structured_result = safe_summary.pop("_private_structured_result", None)
+        if IS_LEDGERFORGE and exit_code == 0 and operation in {"build-debug", "build-release"}:
+            safe_summary["build_artifact_evidence"] = _build_artifact_evidence(operation, raw_output)
         if isinstance(private_structured_result, dict):
             current_state = read_state(run_id)
             private_structured_result = {
                 **private_structured_result,
                 "run_id": run_id,
+        "project": PROJECT_ID,
                 "operation_id": current_state.get("operation_id"),
                 "lease_id": current_state.get("lease_id"),
                 "execution_id": current_state.get("execution_id"),
@@ -2430,7 +2691,10 @@ def validation_worker(
             "safe_test_summary": safe_summary,
             "xcresult_evidence": safe_xcresult_evidence(safe_summary),
             "validation_intent": validation_intent,
-            "publication_eligible": not (operation in {"test-focused", "test-full"} and validation_intent == "compile_only"),
+            "publication_eligible": (
+                (validation_intent == "execute_tests" and operation in {"test-focused", "test-full", "cycle-close"})
+                or (validation_intent == "compile_only" and operation in {"build-debug", "build-release"})
+            ),
             "private_build_diagnostics": private_build_diagnostics,
             "private_structured_result": private_structured_result,
             "private_result_contract": private_result_contract,
@@ -2573,6 +2837,7 @@ def _strict_generic_root_path(root_id: str, path: str, *, allow_root: bool = Fal
     if not allow_root and relative.as_posix() in {"", "."}:
         raise PermissionError("Selected root itself is not a file target.")
     root = roots[root_id]
+    check_project_path(root_id, root, supplied)
     current = root
     for index, part in enumerate(parts):
         current = current / part
@@ -3061,11 +3326,22 @@ def _sandbox_profile(workspace: Path, execution_class: str) -> str:
         '(deny mach-lookup (global-name "com.apple.SecurityServer"))',
     ]
     if execution_class == "repository":
+        if repo == WORKSPACE_ROOT: raise PermissionError("Select a project directory for process execution.")
+        if repo == BRIDGE_ROOT: raise PermissionError("Installation is maintained locally.")
         lines.extend([
             f'(allow file-read* (subpath "{_sandbox_escape(repo)}"))',
             f'(allow file-write* (subpath "{_sandbox_escape(repo)}"))',
             f'(deny file-write* (subpath "{_sandbox_escape(repo / ".git")}"))',
         ])
+        for base, dirs, files in os.walk(repo, followlinks=False):
+            folder = Path(base)
+            for name in list(dirs):
+                child = folder / name
+                if child == BRIDGE_ROOT or (child / ".git").exists():
+                    lines.append(f'(deny file-read* file-write* (subpath "{_sandbox_escape(child)}"))')
+                    dirs.remove(name)
+                elif name == ".git" or child.is_symlink():
+                    dirs.remove(name)
     return "\n".join(lines) + "\n"
 
 def _materialized_input_path(workspace: Path, index: int, source_name: str) -> Path:
@@ -3507,6 +3783,14 @@ def require_execution_lease_no_refresh(lease_id: str, lease_token: str) -> dict[
         raise PermissionError("Execution lease token mismatch.")
     return lease
 
+if INSTANCE_PROJECT is not None:
+    PROJECT_NODE = (REPO.stat().st_dev, REPO.stat().st_ino)
+    identity_file = RUNS / "identity.json"
+    identity = {"project": PROJECT_ID, "device": REPO.stat().st_dev, "inode": REPO.stat().st_ino}
+    if identity_file.exists() and json.loads(identity_file.read_text()) != identity:
+        raise RuntimeError("Project identity changed. Inspect its preserved state before recovery.")
+    if not identity_file.exists():
+        atomic_write_json(identity_file, identity)
 STARTUP_RECONCILIATION = startup_reconcile()
 
 # ==========================================================================
@@ -3564,7 +3848,7 @@ def require_admin_scope() -> AccessToken:
 
 
 mcp = MCPServer(
-    "LedgerForge Recovery Executor",
+    "ChatGPT MCP",
     token_verifier=StaticBearerVerifier(BEARER_TOKEN, ADMIN_BEARER_TOKEN),
     auth=AuthSettings(
         issuer_url=AnyHttpUrl(ISSUER_URL),
@@ -3572,14 +3856,114 @@ mcp = MCPServer(
         required_scopes=["ledgerforge:execute"],
     ),
     instructions=(
-        "Guarded LedgerForge coding executor. It provides bounded repository/evidence reads, "
-        "worktree-confined text file mutations, registered repository tasks, build/test validation, "
-        "and guarded exact Git stage/commit/normal-push operations, plus reviewed binary/root operations, task workspaces, and sandbox-confined argv execution. "
-        "It does not expose unreviewed process execution, Git reset/restore/clean/rebase/history rewrite, live self-overwrite during an MCP request, "
-        "a generic admin shell, or secret credential values. A separate ledgerforge:admin credential can inspect/stage/qualify/arm immutable MCP releases; activation remains local/manual. Private originals are read-only. Snapshot/lease/provenance state is mechanical only, "
-        "never project authorization."
+        "Private development workspace. Call workspace_projects, then pass the exact project ID on every project tool. "
+        "Leases, scratch, validation, adoption and publication are project-bound. "
+        "LedgerForge build and private validation are project-specific. Local maintenance activates armed releases."
     ),
 )
+
+
+GLOBAL_TOOLS = {"executor_capabilities", "executor_help", "host_status", "workspace_projects",
+                "maintenance_status", "maintenance_file_inspect", "maintenance_release"}
+LEDGERFORGE_TOOLS = {"run_repo_task", "test_discovery", "documentation_sync_preflight",
+                     "runtime_launch", "runtime_status", "runtime_logs", "runtime_stop",
+                     "test_impact_advisor", "swift_xcode_audit", "fixture_provenance_inspect",
+                     "run_regression_campaign", "private_context_matrix", "ci_status_inspection"}
+_engine_lock = threading.RLock()
+_project_engines = {}
+_DISCOVERY_SKIP = {".git", ".build", ".venv", "node_modules", "DerivedData", "__pycache__"}
+
+def _git_location(path):
+    env = dict(git_env(), GIT_CEILING_DIRECTORIES=str(WORKSPACE_ROOT.parent))
+    result = subprocess.run(["/usr/bin/git", "-C", str(path), "rev-parse", "--path-format=absolute",
+                             "--show-toplevel", "--absolute-git-dir", "--git-common-dir"],
+                            capture_output=True, text=True, env=env, timeout=10)
+    rows = result.stdout.strip().splitlines()
+    return (result.returncode == 0 and len(rows) == 3 and Path(rows[0]).resolve() == path
+            and all(Path(item).resolve().is_relative_to(WORKSPACE_ROOT) for item in rows))
+
+def select_project(project):
+    if not isinstance(project, str) or not project or len(project) > 1024:
+        raise ValueError("Supply the exact workspace-relative project identifier.")
+    rel = Path(project)
+    if rel.is_absolute() or rel.as_posix() != project or any(x in {"..", ".git"} for x in rel.parts):
+        raise ValueError("Project identifier must be a canonical workspace-relative path.")
+    path = WORKSPACE_ROOT / rel
+    if path.resolve() != path or not path.is_dir():
+        raise ValueError("Selected project is missing or contains a symbolic link.")
+    if path != BRIDGE_ROOT and path.is_relative_to(BRIDGE_ROOT):
+        raise PermissionError("MCP installation internals are managed by local maintenance.")
+    marker = path / ".git"
+    if path != WORKSPACE_ROOT and not marker.exists() and path.parent != WORKSPACE_ROOT:
+        raise ValueError("Select the top-level directory or exact nested repository.")
+    if marker.exists() or marker.is_symlink():
+        if not _git_location(path):
+            raise ValueError("The selected repository has an unresolved or external Git directory.")
+    elif any((parent / ".git").exists() for parent in path.parents if parent.is_relative_to(WORKSPACE_ROOT)):
+        raise ValueError("Select the enclosing repository and use a repository-relative file path.")
+    return path
+
+def discover_projects():
+    projects = []
+    for base, dirs, files in os.walk(WORKSPACE_ROOT, followlinks=False):
+        path = Path(base)
+        if path != WORKSPACE_ROOT and (path.parent == WORKSPACE_ROOT or ".git" in dirs or ".git" in files):
+            git = ".git" in dirs or ".git" in files
+            projects.append({"project": path.relative_to(WORKSPACE_ROOT).as_posix(),
+                             "kind": "repository" if git else "directory",
+                             "available": not git or _git_location(path)})
+        if path == BRIDGE_ROOT:
+            dirs.clear()
+        else:
+            dirs[:] = sorted(d for d in dirs if d not in _DISCOVERY_SKIP and not (path / d).is_symlink())
+    return sorted(projects, key=lambda row: row["project"])
+
+def project_engine(project):
+    path = select_project(project)
+    if path == DEFAULT_REPO:
+        return sys.modules[__name__]
+    with _engine_lock:
+        if path not in _project_engines:
+            name = "_chatgpt_mcp_project_" + hashlib.sha256(str(path).encode()).hexdigest()
+            spec = importlib.util.spec_from_file_location(name, __file__)
+            module = importlib.util.module_from_spec(spec)
+            module._bound_project = path
+            module._bound_boot = EXECUTOR_BOOT_ID
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                sys.modules.pop(name, None)
+                raise
+            _project_engines[path] = module
+        engine = _project_engines[path]
+        stat_now = path.stat()
+        if engine.PROJECT_NODE != (stat_now.st_dev, stat_now.st_ino):
+            raise RuntimeError("The project directory was replaced. Inspect its prior state.")
+        return engine
+
+def project_handler(fn):
+    signature = inspect.signature(fn, eval_str=True)
+    parameter = inspect.Parameter("project", inspect.Parameter.KEYWORD_ONLY, annotation=str)
+    @functools.wraps(fn)
+    def routed(*, project, **arguments):
+        engine = project_engine(project)
+        if fn.__name__ == "evidence_batch" and not engine.IS_LEDGERFORGE:
+            for job in arguments.get("jobs", []):
+                values = job.model_dump() if hasattr(job, "model_dump") else job
+                if values.get("kind", values.get("tool")) in LEDGERFORGE_TOOLS:
+                    raise PermissionError("The evidence batch includes a LedgerForge-specific tool.")
+        if fn.__name__ in LEDGERFORGE_TOOLS and not engine.IS_LEDGERFORGE:
+            raise PermissionError("This tool is specific to the LedgerForge project.")
+        if engine.REPO == BRIDGE_ROOT and not TOOL_ANNOTATION_CONTRACT[fn.__name__]["read_only"]:
+            raise PermissionError("Use qualified MCP maintenance for changes to the running installation.")
+        if (fn.__name__.startswith("git_") or fn.__name__ in {"start_validation", "adopt_publication_candidate"}) and not engine.IS_GIT:
+            raise ValueError("This operation requires a Git repository.")
+        result = getattr(engine, fn.__name__)(**arguments)
+        return {**result, "project": project} if isinstance(result, dict) else result
+    routed.__signature__ = signature.replace(parameters=[*signature.parameters.values(), parameter])
+    routed.__annotations__ = {**typing.get_type_hints(fn, include_extras=True), "project": str}
+    return routed
 
 
 def tool(*, read_only: bool, destructive: bool = False, idempotent: bool = False, open_world: bool = False):
@@ -3609,13 +3993,21 @@ def tool(*, read_only: bool, destructive: bool = False, idempotent: bool = False
                 kwargs = {}
         except Exception:
             pass
-        return mcp.tool(**kwargs)(fn)
+        if INSTANCE_PROJECT is None:
+            handler = fn if fn.__name__ in GLOBAL_TOOLS else project_handler(fn)
+            mcp.tool(**kwargs)(handler)
+        return fn
     return decorator
 
 
 # ==========================================================================
 # Read-only MCP tools
 # ==========================================================================
+
+@tool(read_only=True, idempotent=True)
+def workspace_projects() -> dict[str, Any]:
+    """Discover workspace-relative project identifiers, including nested repositories."""
+    return {"workspace": str(WORKSPACE_ROOT), "projects": discover_projects()}
 
 @tool(read_only=True)
 def executor_capabilities() -> dict[str, Any]:
@@ -3624,6 +4016,11 @@ def executor_capabilities() -> dict[str, Any]:
     config = load_feature_config()
     return enforce_structured_output({
         "executor_version": EXECUTOR_VERSION,
+        "workspace_root": str(WORKSPACE_ROOT),
+        "project_routing": "explicit project argument",
+        "loaded_source_sha256": LOADED_SOURCE_SHA256,
+        "installed_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest() if Path(__file__).is_file() else None,
+        "state_root": str(PRODUCTION_STATE),
         "toolset_revision": TOOLSET_REVISION,
         "schema_contract_revision": SCHEMA_CONTRACT_REVISION,
         "schema_contract_sha256": schema_contract_digest(),
@@ -3653,8 +4050,19 @@ def executor_capabilities() -> dict[str, Any]:
             "automatic_rollback": False,
         },
         "registered_secret_refs": sorted(registered_secret_refs()),
-        "owner_break_glass_command": str(Path.home() / "Desktop" / "LedgerForge MCP Owner Recovery.command"),
-        "git_operations": ["inspect", "fetch-origin", "stage-exact", "commit-staged", "push-origin-main"],
+        "owner_break_glass_command": str(BRIDGE_ROOT / "mcp_control.py") + " recovery",
+        "git_operations": ["inspect", "fetch-origin", "stage-exact", "commit-staged", "adopt-existing-publication-candidate", "push-origin-main"],
+        "launcher_contract": {"native_application": "ChatGPT MCP.app", "service_control": "mcp_control.py", "owner_recovery_integrated": True, "legacy_owner_wrapper_required": False},
+        "publication_policy": {"revision": PUBLICATION_POLICY_REVISION, "classes": ["documentation_static", "project_integrity_compile", "test_executing"], "strongest_effect_wins": True, "caller_labels_can_downgrade": False},
+        "publication_candidate_adoption": {
+            "supported": True,
+            "source": "adopted-existing-commit",
+            "requires_exact_current_validation": True,
+            "requires_fresh_origin_fetch": True,
+            "requires_single_commit_fast_forward": True,
+            "push_performed_by_adoption": False,
+            "repository_worktree_index_head_mutated_by_adoption": False,
+        },
         "repo_tasks": sorted(repo_task_registry()),
         "validation_operations": sorted(ALLOWED_VALIDATIONS),
         "private_contexts": sorted(PRIVATE_CONTEXTS),
@@ -3709,9 +4117,9 @@ def executor_help(topic: Literal["overview", "reads", "mutation", "validation", 
         "cleanup": "Use task_workspace action=close to wait boundedly for owned processes, then clean safely.",
     }
     topics = {
-        "overview": ["Inspect: execution_snapshot/workspace_state", "Mutate: lease then reviewed file/process operations", "Validate: start_validation then validation_wait_result", "Publish: exact git_stage/commit/push", "Admin maintenance requires a separate ledgerforge:admin credential."],
+        "overview": ["Inspect: execution_snapshot/workspace_state", "Mutate: lease then reviewed file/process operations", "Validate: start_validation then validation_wait_result", "Publish: exact git_stage/commit/push; recover an interrupted commit with adopt_publication_candidate", "Admin maintenance requires a separate ledgerforge:admin credential."],
         "reads": ["Use evidence_batch for a stable grouped read.", "Use local_fs_inspect for binary-safe registered-root stat/hash/range reads."],
-        "mutation": ["Never reuse stale fingerprints.", "Repository writes require lease + exact HEAD/worktree/index.", "Generic Git metadata writes remain forbidden."],
+        "mutation": ["Never reuse stale fingerprints.", "Repository writes require lease + exact HEAD/worktree/index.", "Generic Git metadata writes remain forbidden.", "adopt_publication_candidate only mints a lease-local capability for one freshly fetched, single-commit fast-forward; it never pushes or rewrites Git."],
         "validation": ["test-focused/test-full fail closed on zero tests.", "test_discovery reports conservative selector capability metadata.", "validation_wait_result combines bounded wait and retained result retrieval."],
         "process": ["process_start is reviewed argv execution with network denied.", "Use task workspaces; declared external inputs are snapshot-copied.", "Private-original-derived inputs taint scratch and cannot receive repository write scope.", "Repository-class processes require an expected changed-path allowlist and bounded effect count.", "process state/results survive client disconnect."],
         "recovery": ["execution_snapshot groups lease, validation, processes, workspaces and cleanup safety.", "Owner Recovery remains local break-glass and independent of ChatGPT."],
@@ -3721,29 +4129,44 @@ def executor_help(topic: Literal["overview", "reads", "mutation", "validation", 
 
 @tool(read_only=True)
 def host_status() -> dict[str, Any]:
-    """Return bounded non-secret executor/tunnel host health."""
-    def pgrep(pattern: str) -> list[int]:
+    """Return bounded non-secret Executor plus independently supervised tunnel health."""
+    def pgrep_exact_profile(profile: str) -> list[int]:
+        escaped = re.escape(profile)
+        pattern = rf"tunnel-client run --profile {escaped}(?:\s|$)"
         result = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, check=False, timeout=5)
         return [int(v) for v in result.stdout.split() if v.isdigit()]
-    health = False
-    ready = False
-    for endpoint, key in (("http://127.0.0.1:8080/healthz", "health"), ("http://127.0.0.1:8080/readyz", "ready")):
+
+    def endpoint_state(port: int) -> dict[str, bool]:
+        values = {"healthz": False, "readyz": False}
+        for name in values:
+            try:
+                with urlopen(f"http://127.0.0.1:{port}/{name}", timeout=1.5) as response:
+                    values[name] = 200 <= response.status < 300
+            except Exception:
+                values[name] = False
+        return values
+
+    def listener_pids(port: int) -> list[int]:
         try:
-            with urlopen(endpoint, timeout=1.5) as response:
-                ok = 200 <= response.status < 300
+            result = subprocess.run(["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"], capture_output=True, text=True, check=False, timeout=5)
+            return [int(v) for v in result.stdout.split() if v.isdigit()]
         except Exception:
-            ok = False
-        if key == "health":
-            health = ok
-        else:
-            ready = ok
-    port = int(os.environ.get(PORT_ENV, "8768"))
-    listening = False
-    try:
-        result = subprocess.run(["lsof", "-tiTCP:%d" % port, "-sTCP:LISTEN"], capture_output=True, text=True, check=False, timeout=5)
-        listening = bool(result.stdout.strip())
-    except Exception:
-        pass
+            return []
+
+    executor_port = int(os.environ.get(PORT_ENV, "8768"))
+    normal_profile = "ledgerforge-recovery"
+    admin_profile = "ledgerforge-recovery-admin"
+    port_settings = BRIDGE_ROOT / ".mcp-maintenance" / "service-ports.json"
+    ports = json.loads(port_settings.read_text()) if port_settings.is_file() else {}
+    normal_port = int(ports.get("executor-tunnel", 8080))
+    admin_port = int(ports.get("admin-tunnel", 8081))
+    normal = endpoint_state(normal_port)
+    admin = endpoint_state(admin_port)
+    normal_pids = pgrep_exact_profile(normal_profile)
+    admin_pids = pgrep_exact_profile(admin_profile)
+    executor_listener_pids = listener_pids(executor_port)
+    normal_listener_pids = listener_pids(normal_port)
+    admin_listener_pids = listener_pids(admin_port)
     recovery = STARTUP_RECONCILIATION
     return {
         "executor_version": EXECUTOR_VERSION,
@@ -3752,11 +4175,28 @@ def host_status() -> dict[str, Any]:
         "executor_boot_id": EXECUTOR_BOOT_ID,
         "executor_pid": os.getpid(),
         "repo_root": str(REPO),
-        "executor_port": port,
-        "executor_port_listening": listening,
-        "tunnel_client_processes": pgrep("tunnel-client run --profile ledgerforge-recovery"),
-        "tunnel_healthz": health,
-        "tunnel_readyz": ready,
+        "executor_port": executor_port,
+        "executor_port_listening": bool(executor_listener_pids),
+        "executor_listener_pids": executor_listener_pids,
+        "executor_tunnel": {
+            "profile": normal_profile,
+            "process_pids": normal_pids,
+            "listener_port": normal_port,
+            "listener_pids": normal_listener_pids,
+            "listener_present": bool(normal_listener_pids),
+            "healthz": normal["healthz"],
+            "readyz": normal["readyz"],
+        },
+        "admin_tunnel": {
+            "profile": admin_profile,
+            "process_pids": admin_pids,
+            "listener_port": admin_port,
+            "listener_pids": admin_listener_pids,
+            "listener_present": bool(admin_listener_pids),
+            "healthz": admin["healthz"],
+            "readyz": admin["readyz"],
+        },
+        "tunnel_profile_match_contract": "exact-profile-token-boundary-v1",
         "run_state_root_ready": RUNS.is_dir(),
         "private_contexts": {name: private_context_available(name) for name in PRIVATE_CONTEXTS},
         "active_execution_lease": public_lease_view(read_active_lease_raw()),
@@ -3774,7 +4214,7 @@ def host_status() -> dict[str, Any]:
 
 @tool(read_only=True)
 def workspace_state() -> dict[str, Any]:
-    """Return complete local LedgerForge Git/worktree safety state."""
+    """Return Git and working-tree state for the explicitly selected project."""
     state = workspace_snapshot()
     state["execution_lease"] = public_lease_view(read_active_lease_raw())
     state["executor_boot_id"] = EXECUTOR_BOOT_ID
@@ -4002,6 +4442,7 @@ def execution_snapshot(
     lease_material = {k: lease.get(k) for k in (
         "active", "lease_id", "execution_id", "authorization_digest", "baseline_head",
         "baseline_worktree_fingerprint", "status", "sequence", "executor_boot_id",
+        "publication_candidate", "publication_candidate_invalidated_at", "publication_candidate_invalidated_reason",
     )}
     active_validation_material = None
     if isinstance(active_validation, dict):
@@ -4106,7 +4547,7 @@ def acquire_execution_lease(
     provenance_label: ProvenanceLabel | None = None,
     ttl_seconds: LeaseTTLSeconds = DEFAULT_LEASE_SECONDS,
 ) -> dict[str, Any]:
-    """Acquire the single LedgerForge mutable execution lease and return its opaque capability token once."""
+    """Acquire the selected project’s mutable execution lease and return its opaque capability token once."""
     payload = {
         "expected_head": expected_head,
         "expected_worktree_fingerprint": expected_worktree_fingerprint,
@@ -4139,6 +4580,9 @@ def acquire_execution_lease(
                 now = datetime.now(timezone.utc)
                 lease = {
                     "lease_id": lease_id,
+                    "project": PROJECT_ID,
+                    "origin_digest": origin_digest() if IS_GIT else None,
+                    "publication_branch": publication_branch() if IS_GIT else None,
                     "token_digest": lease_token_digest(token),
                     "execution_id": execution_id or str(uuid.uuid4()),
                     "authorization_digest": authorization_digest.casefold(),
@@ -4322,7 +4766,7 @@ def list_files(
     glob: str | None = None,
     max_results: ListResultLimit = 500,
 ) -> dict[str, Any]:
-    """List files under one approved LedgerForge evidence root, including ignored repo files."""
+    """List files under an approved workspace or project evidence root, including ignored repo files."""
     if max_results < 1 or max_results > MAX_LIST_RESULTS:
         raise ValueError(f"max_results must be 1...{MAX_LIST_RESULTS}.")
     relative, base, root = normalize_root_path(root_id, path, allow_root=True)
@@ -4332,10 +4776,10 @@ def list_files(
     results: list[str] = []
     for current, dirs, files in os.walk(base, followlinks=False):
         current_path = Path(current)
-        dirs[:] = [d for d in dirs if d != ".git" and not (current_path / d).is_symlink()]
+        dirs[:] = [d for d in dirs if d != ".git" and not (current_path / d).is_symlink() and walk_allowed(root_id, root, current_path / d)]
         for name in files:
             candidate = current_path / name
-            if candidate.is_symlink() or is_secret_name(candidate):
+            if candidate.is_symlink() or is_secret_name(candidate) or not walk_allowed(root_id, root, candidate):
                 continue
             try:
                 rel = candidate.resolve().relative_to(root).as_posix()
@@ -4357,7 +4801,7 @@ def read_file(
     end_line: int | None = None,
     max_bytes: ToolOutputBytes = 80_000,
 ) -> dict[str, Any]:
-    """Read bounded sanitized UTF-8 text from an approved LedgerForge evidence root."""
+    """Read bounded sanitized UTF-8 text from an approved workspace or project evidence root."""
     validate_output_limit(max_bytes)
     if start_line < 1:
         raise ValueError("start_line must be at least 1.")
@@ -4410,10 +4854,10 @@ def search_files(
     matches: list[dict[str, Any]] = []
     for current, dirs, files in os.walk(base, followlinks=False):
         current_path = Path(current)
-        dirs[:] = [d for d in dirs if d != ".git" and not (current_path / d).is_symlink()]
+        dirs[:] = [d for d in dirs if d != ".git" and not (current_path / d).is_symlink() and walk_allowed(root_id, root, current_path / d)]
         for name in files:
             candidate = current_path / name
-            if candidate.is_symlink() or is_secret_name(candidate):
+            if candidate.is_symlink() or is_secret_name(candidate) or not walk_allowed(root_id, root, candidate):
                 continue
             try:
                 rel = candidate.resolve().relative_to(root).as_posix()
@@ -4481,7 +4925,7 @@ def artifact_inspect(
     max_rows: SQLRowLimit = 100,
     max_bytes: ToolOutputBytes = 80_000,
 ) -> dict[str, Any]:
-    """Inspect supported LedgerForge artifacts with aggregate byte limits and private-safe xcresult handling."""
+    """Inspect supported project artifacts with aggregate byte limits and private-safe xcresult handling."""
     validate_output_limit(max_bytes)
     relative, candidate, root = normalize_root_path(root_id, path)
     ensure_no_symlink_escape(candidate, root)
@@ -4573,6 +5017,8 @@ def git_inspect(
 ) -> dict[str, Any]:
     """Inspect bounded Git state/diffs/log/show/blame without mutation or fetch."""
     validate_output_limit(max_bytes)
+    if ref and (ref.startswith("-") or "\x00" in ref):
+        raise ValueError("Invalid Git reference.")
     if mode == "state":
         return workspace_snapshot()
     args: list[str]
@@ -4624,6 +5070,8 @@ def local_fs_inspect(
     relative, candidate, root = _strict_generic_root_path(
         root_id, path, allow_root=allow_root, allow_final_symlink=(action == "stat")
     )
+    if root_id == "ledgerforge_logs" and action == "read_bytes":
+        raise PermissionError("Use read_file for credential-filtered logs.")
     if action == "stat":
         return _local_file_metadata(root_id, relative, candidate)
     if action == "hash":
@@ -4774,7 +5222,7 @@ def task_workspace(
     provenance_label: ProvenanceLabel | None = None,
     wait_seconds: WaitSeconds = 60,
 ) -> dict[str, Any]:
-    """Create/status/cleanup or safely close one exact MCP-owned task scratch workspace outside the product repository."""
+    """Create/status/cleanup or safely close one exact MCP-owned task scratch workspace outside the selected repository."""
     payload = {"workspace_id": workspace_id, "action": action, "task_label": task_label, "provenance_label": provenance_label, "wait_seconds": wait_seconds}
     replay, prior = begin_operation(operation_id, "task_workspace", payload)
     if replay:
@@ -4965,6 +5413,7 @@ def process_start(
         run_id = str(uuid.uuid4())
         state = {
             "run_id": run_id,
+        "project": PROJECT_ID,
             "operation_id": operation_id,
             "workspace_id": workspace_id,
             "lease_id": lease_id,
@@ -5743,18 +6192,677 @@ def staged_blob_bytes(relative: str, max_bytes: int = 8 * 1024 * 1024) -> bytes 
     return result.stdout if result.returncode == 0 else None
 
 
-def scan_staged_blobs(max_paths: int = 100) -> dict[str, Any]:
-    paths = staged_paths()
-    violations: list[dict[str, str]] = []
-    suspicious: list[dict[str, str]] = []
+def require_commit_sha(value: str, label: str) -> str:
+    """Validate a caller-provided immutable Git object identity before use."""
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Fa-f0-9]{40,64}", value):
+        raise ValueError(f"{label} must be a full Git commit SHA.")
+    return value.casefold()
+
+
+def require_fingerprint(value: str, label: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Fa-f0-9]{64}", value):
+        raise ValueError(f"{label} must be an exact SHA-256 fingerprint.")
+    return value.casefold()
+
+
+def commit_parent_sha(commit_head: str) -> str:
+    """Return the sole parent of a linear publication commit.
+
+    Adoption intentionally rejects root and merge commits. The managed
+    publication contract is a single normal fast-forward commit whose parent
+    is the freshly fetched tracking ref.
+    """
+    parents = run_git("rev-list", "--parents", "-n", "1", commit_head).split()
+    if len(parents) != 2 or parents[0].casefold() != commit_head.casefold():
+        raise RuntimeError("Publication adoption requires a single-parent commit; merge/root commits are refused.")
+    return parents[1].casefold()
+
+
+def commit_tree_sha(commit_head: str) -> str:
+    tree = run_git("show", "-s", "--format=%T", commit_head).strip().casefold()
+    if not re.fullmatch(r"[A-Fa-f0-9]{40,64}", tree):
+        raise RuntimeError("Publication commit tree identity is unavailable.")
+    return tree
+
+
+def commit_diff_rows(parent_head: str, commit_head: str) -> list[dict[str, str]]:
+    """Derive changed paths/statuses from Git, never from caller input."""
+    raw = run_git(
+        "diff-tree", "--no-commit-id", "--name-status", "--no-renames", "-r", "-z",
+        parent_head, commit_head, "--", strip=False,
+    )
+    parts = [item for item in raw.split("\0") if item]
+    if len(parts) % 2:
+        raise RuntimeError("Git returned an invalid commit path identity record.")
+    rows: list[dict[str, str]] = []
+    for index in range(0, len(parts), 2):
+        status = parts[index]
+        relative = parts[index + 1]
+        if not status or status[0] not in {"A", "D", "M", "T", "U", "X"} or "\x00" in relative:
+            raise RuntimeError("Git returned an unsupported commit path identity record.")
+        # Git paths in this repository are relative POSIX paths. Reject an
+        # unexpected absolute/parent path rather than allowing a malformed
+        # repository record to influence a privacy decision.
+        candidate = Path(relative)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise RuntimeError("Git returned an unsafe commit path identity.")
+        rows.append({"path": relative, "status": status[0]})
+    return rows
+
+
+def committed_blob_bytes(commit_head: str, relative: str, max_bytes: int = 8 * 1024 * 1024) -> bytes | None:
+    """Read one immutable commit blob with a bounded, non-user-controlled path."""
+    object_name = f"{commit_head}:{relative}"
+    size_result = subprocess.run(
+        ["git", "-C", str(REPO), "cat-file", "-s", object_name],
+        capture_output=True, text=True, env=git_env(), check=False, timeout=10,
+    )
+    if size_result.returncode != 0:
+        return None
+    try:
+        size = int(size_result.stdout.strip())
+    except ValueError:
+        return None
+    if size < 0 or size > max_bytes:
+        return None
+    result = subprocess.run(
+        ["git", "-C", str(REPO), "show", object_name],
+        capture_output=True, env=git_env(), check=False, timeout=20,
+    )
+    return result.stdout if result.returncode == 0 and len(result.stdout) == size else None
+
+
+def _privacy_path_violation(relative: str) -> str | None:
+    low = relative.casefold()
+    forbidden_fragments = (
+        ".executor-path", ".mcp-path", ".executor-secret-refs.json", "ledgerforge-runtime-key",
+    "ledgerforge-admin-auth-header", "ledgerforge-recovery.yaml", "ledgerforge-recovery-admin.yaml",
+    ".executor-token", ".executor-path", ".mcp-path", "deriveddata", ".xcresult",
+        "xcuserdata", ".sqlite-wal", ".sqlite-shm",
+    )
+    forbidden_suffixes = (".sqlite", ".sqlite3", ".db", ".p12", ".pfx", ".pem", ".key")
+    if is_secret_name(Path(relative)) or any(fragment in low for fragment in forbidden_fragments) or any(low.endswith(s) for s in forbidden_suffixes):
+        return "prohibited-artifact-path"
+    return None
+
+
+def _pbx_parse(data: bytes) -> dict[str, Any]:
+    """Bounded OpenStep plist reader. Duplicate keys/unknown escapes fail closed."""
+    if not data or len(data) > 8 * 1024 * 1024:
+        raise ValueError("project-size-bound")
+    text = data.decode("utf-8")
+    if "\x00" in text:
+        raise ValueError("project-nul")
+    token = re.compile(r'\s+|//[^\n]*(?:\n|$)|/\*[\s\S]*?\*/|"(?:[^"\\]|\\.)*"|[{}()=;,]|[A-Za-z0-9_./$<>+\-]+')
+    items = []
+    pos = 0
+    while pos < len(text):
+        m = token.match(text, pos)
+        if not m:
+            raise ValueError("project-token-ambiguous")
+        value = m.group(0)
+        pos = m.end()
+        if value.isspace() or value.startswith(("//", "/*")):
+            continue
+        if value.startswith('"'):
+            items.append(("s", json.loads(value)))
+        elif value in "{}()=;,":
+            items.append((value, value))
+        else:
+            items.append(("s", value))
+        if len(items) > 250000:
+            raise ValueError("project-token-bound")
+    cursor = 0
+    def take(kind):
+        nonlocal cursor
+        if cursor >= len(items) or items[cursor][0] != kind:
+            raise ValueError("project-grammar-ambiguous")
+        value = items[cursor][1]
+        cursor += 1
+        return value
+    def parse(depth=0):
+        if depth > 96 or cursor >= len(items):
+            raise ValueError("project-nesting-bound")
+        kind = items[cursor][0]
+        if kind == "{":
+            take("{"); out = {}
+            while cursor < len(items) and items[cursor][0] != "}":
+                key = take("s")
+                if key in out:
+                    raise ValueError("project-duplicate-key")
+                take("="); out[key] = parse(depth+1); take(";")
+            take("}")
+            return out
+        if kind == "(":
+            take("("); out = []
+            while cursor < len(items) and items[cursor][0] != ")":
+                out.append(parse(depth+1))
+                if cursor < len(items) and items[cursor][0] == ")":
+                    break
+                take(",")
+            take(")")
+            return out
+        return take("s")
+    result = parse()
+    if cursor != len(items) or not isinstance(result, dict):
+        raise ValueError("project-root-ambiguous")
+    return result
+
+
+def _pbx_resource_delta(before: bytes, after: bytes, relative: str) -> dict[str, Any]:
+    """Compare full object graphs, not comment labels or isolated changed lines."""
+    def require(ok, reason):
+        if not ok:
+            raise ValueError(reason)
+    old, new = _pbx_parse(before), _pbx_parse(after)
+    top = {"archiveVersion", "classes", "objectVersion", "objects", "rootObject"}
+    require(set(old) == top and set(new) == top, "project-envelope-ambiguous")
+    require({k:v for k,v in old.items() if k != "objects"} == {k:v for k,v in new.items() if k != "objects"}, "project-envelope-changed")
+    left, right = old["objects"], new["objects"]
+    require(isinstance(left, dict) and isinstance(right, dict), "project-objects-invalid")
+    for objects in (left, right):
+        require(len(objects) <= 50000 and all(re.fullmatch(r"[A-Fa-f0-9]{24}", k) and isinstance(v, dict) and isinstance(v.get("isa"), str) for k,v in objects.items()), "project-object-shape")
+    root_id = old["rootObject"]
+    require(root_id in left and root_id in right and left[root_id] == right[root_id] and left[root_id].get("isa") == "PBXProject", "project-root-changed")
+    project = left[root_id]
+    require(project.get("projectDirPath", "") == "" and project.get("projectRoot", "") == "", "custom-project-root")
+    main = project.get("mainGroup")
+    targets = project.get("targets")
+    require(isinstance(targets, list) and len(targets) == len(set(targets)), "project-targets-invalid")
+    def sequence_delta(a, b):
+        require(isinstance(a, list) and isinstance(b, list) and all(isinstance(x,str) for x in a+b), "membership-not-string-array")
+        require(len(a)==len(set(a)) and len(b)==len(set(b)), "duplicate-membership")
+        require([x for x in a if x in b] == [x for x in b if x in a], "existing-membership-reordered")
+        return set(b)-set(a), set(a)-set(b)
+    added, removed = set(right)-set(left), set(left)-set(right)
+    bf_add, bf_del, ref_add, ref_del = set(), set(), set(), set()
+    for ids, objects, bfs, refs in ((added,right,bf_add,ref_add),(removed,left,bf_del,ref_del)):
+        for ident in ids:
+            obj = objects[ident]
+            if obj["isa"] == "PBXBuildFile":
+                require(set(obj)=={"isa","fileRef"}, "buildfile-settings-or-attributes")
+                bfs.add(ident)
+            elif obj["isa"] == "PBXFileReference":
+                require(set(obj) <= {"isa","path","sourceTree","lastKnownFileType","name"} and {"path","sourceTree"} <= set(obj), "file-reference-attributes")
+                refs.add(ident)
+            else:
+                raise ValueError("non-resource-object-lifecycle")
+    member_add, member_del, child_add, child_del = set(), set(), set(), set()
+    for ident in set(left)&set(right):
+        a,b = left[ident],right[ident]
+        if a==b:
+            continue
+        require(a["isa"]==b["isa"], "object-type-changed")
+        field = "files" if a["isa"]=="PBXResourcesBuildPhase" else "children" if a["isa"]=="PBXGroup" else None
+        require(field is not None, "non-resource-project-behavior-change")
+        require({k:v for k,v in a.items() if k!=field} == {k:v for k,v in b.items() if k!=field}, "project-object-settings-changed")
+        inc,dec = sequence_delta(a.get(field), b.get(field))
+        if field=="files":
+            owners = [t for t in targets if t in left and ident in left[t].get("buildPhases", [])]
+            require(len(owners)==1 and left[owners[0]]["isa"]=="PBXNativeTarget", "resource-phase-owner-ambiguous")
+            owner = left[owners[0]]
+            require(owner.get("productType") == "com.apple.product-type.application" and owner.get("name") == "LedgerForge" and owner.get("productName", "LedgerForge") == "LedgerForge", "resource-target-not-qualified-application")
+            require(not (member_add&inc or member_del&dec), "buildfile-multiple-resource-phases")
+            member_add |= inc; member_del |= dec
+        else:
+            require(not (child_add&inc or child_del&dec), "reference-multiple-parent-changes")
+            child_add |= inc; child_del |= dec
+    require(member_add==bf_add and member_del==bf_del and bool(bf_add or bf_del), "resource-buildfile-membership-not-exact")
+    require(child_add==ref_add and child_del==ref_del, "group-reference-membership-not-exact")
+    def references(objects, ident):
+        hits=[]
+        def walk(value, at):
+            if isinstance(value, dict):
+                for k,v in value.items(): walk(v,at+(k,))
+            elif isinstance(value,list):
+                for i,v in enumerate(value): walk(v,at+(i,))
+            elif value==ident: hits.append(at)
+        for key,value in objects.items(): walk(value,(key,))
+        return hits
+    def safe_path(value):
+        require(isinstance(value,str) and value and not any(c in value for c in ("$","\\","\x00")), "resource-path-ambiguous")
+        p=Path(value)
+        require(not p.is_absolute() and ".." not in p.parts and all(x not in {"", "."} for x in value.split("/")), "resource-path-escapes-project")
+        return p
+    def group_path(objects, ident, visited=()):
+        require(ident not in visited and len(visited)<96 and ident in objects, "resource-group-cycle")
+        group=objects[ident]
+        require(group.get("isa")=="PBXGroup" and group.get("sourceTree")=="<group>", "resource-group-root-ambiguous")
+        part=safe_path(group["path"]) if group.get("path") else Path()
+        if ident==main: return part
+        parents=[key for key,obj in objects.items() if ident in obj.get("children", [])]
+        require(len(parents)==1, "resource-group-parent-ambiguous")
+        return group_path(objects, parents[0], visited+(ident,))/part
+    def resource(objects, bf, refs, sign):
+        file_id=objects[bf]["fileRef"]
+        require(file_id in objects, "resource-file-reference-missing")
+        obj=objects[file_id]
+        require(obj.get("isa")=="PBXFileReference" and set(obj)<={"isa","path","sourceTree","lastKnownFileType","name"}, "resource-reference-shape")
+        path=safe_path(obj.get("path"))
+        require(path.suffix.lower() in {".json",".txt",".md",".markdown",".csv"}, "resource-type-not-qualified")
+        require(obj.get("lastKnownFileType", "text") in {"text","text.json","text.markdown","text.csv"}, "resource-filetype-not-qualified")
+        uses=references(objects,bf)
+        require(len(uses)==1 and len(uses[0])==3 and uses[0][1]=="files" and objects[uses[0][0]]["isa"]=="PBXResourcesBuildPhase", "buildfile-used-outside-resources")
+        ref_uses=references(objects,file_id)
+        require(all((len(at)==2 and at[1]=="fileRef" and objects[at[0]]["isa"]=="PBXBuildFile") or (len(at)==3 and at[1]=="children" and objects[at[0]]["isa"]=="PBXGroup") for at in ref_uses), "file-reference-used-outside-supported-graph")
+        parents=[at[0] for at in ref_uses if len(at)==3 and at[1]=="children"]
+        require(len(parents)==1, "resource-parent-not-unique")
+        if obj.get("sourceTree")=="<group>": path=group_path(objects,parents[0])/path
+        else: require(obj.get("sourceTree")=="SOURCE_ROOT", "resource-source-tree-ambiguous")
+        path=Path(relative).parent.parent/path
+        require(not path.is_absolute() and ".." not in path.parts, "resource-outside-repository")
+        return {"source_path":path.as_posix(),"bundle_path":path.name,"file_ref":file_id,"sign":sign}
+    bindings=[resource(right,x,ref_add,"+") for x in sorted(bf_add)] + [resource(left,x,ref_del,"-") for x in sorted(bf_del)]
+    require(ref_add <= {b["file_ref"] for b in bindings if b["sign"]=="+"} and ref_del <= {b["file_ref"] for b in bindings if b["sign"]=="-"}, "unrelated-file-reference-change")
+    names=[x["bundle_path"] for x in bindings]
+    require(len(names)==len(set(names)), "resource-bundle-destination-collision")
+    return {"pass":True,"reason":"full-project-resource-membership-only", "resources_added":[b["bundle_path"] for b in bindings if b["sign"]=="+"],"resources_removed":[b["bundle_path"] for b in bindings if b["sign"]=="-"],"resource_bindings":bindings,"project_diff_digest":hashlib.sha256(before+b"\x00"+after).hexdigest()}
+
+
+def _markdown_hardbreak_lines(text: str) -> set[int]:
+    """Record parser-produced hard breaks with checked physical-line provenance."""
+    import markdown_it
+    from markdown_it.rules_inline.newline import newline
+    if markdown_it.__version__ != "4.2.0":
+        raise ValueError("unqualified-markdown-parser-version")
+    if "\x00" in text or "\r" in text.replace("\r\n", ""):
+        raise ValueError("markdown-line-normalization-ambiguous")
+    if len(text) > 1024 * 1024:
+        raise ValueError("markdown-semantic-size-bound")
+    normalized=text.replace("\r\n","\n")
+    physical=normalized.split("\n")
+    approved=set()
+    md=markdown_it.MarkdownIt("commonmark")
+    root_content=None
+    events=[]
+    def located_newline(state,silent):
+        pos=state.pos
+        count=len(state.tokens)
+        result=newline(state,silent)
+        if result and not silent and state.src is root_content and any(t.type=="hardbreak" for t in state.tokens[count:]):
+            events.append(state.src[:pos].count("\n"))
+        return result
+    md.inline.ruler.at("newline",located_newline)
+    def located_inline(state):
+        nonlocal root_content,events
+        for block in state.tokens:
+            if block.type!="inline": continue
+            root_content=block.content; events=[]
+            if block.children is None: block.children=[]
+            state.md.inline.parse(block.content,state.md,state.env,block.children)
+            if events and (block.map is None or len(block.map)!=2):
+                raise ValueError("markdown-inline-map-missing")
+            lines=block.content.split("\n")
+            for offset in events:
+                absolute=block.map[0]+offset
+                if absolute>=block.map[1] or absolute>=len(physical) or offset+1>=len(lines) or not lines[offset].strip() or not physical[absolute].endswith(lines[offset]):
+                    raise ValueError("markdown-hardbreak-source-map-ambiguous")
+                approved.add(absolute+1)
+    md.core.ruler.at("inline",located_inline)
+    md.parse(normalized)
+    return approved
+
+
+_PUBLICATION_CLASS_RANK = {"documentation_static": 1, "project_integrity_compile": 2, "test_executing": 3}
+_DOCUMENTATION_SUFFIXES = {".md", ".markdown"}
+_TEXT_HYGIENE_SUFFIXES = {".md", ".markdown", ".txt", ".swift", ".py", ".sh", ".zsh", ".json", ".yml", ".yaml", ".plist", ".pbxproj", ".sql"}
+
+
+def _project_metadata_diff(relative: str, parent_head: str | None = None, commit_head: str | None = None) -> str:
+    if parent_head and commit_head:
+        return run_git("diff", "--unified=0", parent_head, commit_head, "--", relative)
+    return run_git("diff", "--unified=0", "--", relative)
+
+
+def _project_metadata_containment_evidence(relative: str, parent_head: str | None = None, commit_head: str | None = None) -> dict[str, Any]:
+    if Path(relative).name != "project.pbxproj":
+        return {"pass":False,"reason":"not-project-pbxproj"}
+    try:
+        base=parent_head if parent_head and commit_head else resolve_ref("HEAD")
+        before=committed_blob_bytes(base,relative)
+        if parent_head and commit_head:
+            after=committed_blob_bytes(commit_head,relative)
+        else:
+            path=REPO/relative
+            if path.is_symlink() or not path.is_file() or path.stat().st_size>8*1024*1024:
+                raise ValueError("project-worktree-type-or-size")
+            path.resolve().relative_to(REPO.resolve())
+            after=path.read_bytes()
+        if before is None or after is None:
+            raise ValueError("project-version-missing")
+        return _pbx_resource_delta(before,after,relative)
+    except Exception as exc:
+        return {"pass":False,"reason":"project-semantics-unproven", "detail_type":type(exc).__name__}
+
+
+def _project_metadata_containment_only(relative: str, parent_head: str | None = None, commit_head: str | None = None) -> bool:
+    return _project_metadata_containment_evidence(relative, parent_head, commit_head).get("pass") is True
+
+
+def _project_integrity_evidence(paths: list[str], bound: dict[str, Any] | None, *, parent_head: str | None = None, commit_head: str | None = None) -> dict[str, Any]:
+    build=(bound or {}).get("build_artifact_evidence")
+    if not isinstance(build,dict) or build.get("pass") is not True or build.get("schema")!="build-artifact-evidence-v1":
+        return {"pass":False,"reason":"compile-bundle-evidence-missing"}
+    rows=build.get("resource_manifest")
+    if not isinstance(rows,list) or len(rows)>5000:
+        return {"pass":False,"reason":"bundle-resource-manifest-missing"}
+    canonical=json.dumps(rows,sort_keys=True,separators=(",",":"),ensure_ascii=False)
+    if hashlib.sha256(canonical.encode()).hexdigest()!=build.get("resource_manifest_sha256"):
+        return {"pass":False,"reason":"bundle-resource-manifest-digest-mismatch"}
+    resources={}
+    for row in rows:
+        if not isinstance(row,dict) or set(row)!={"path","size","sha256"} or not isinstance(row["path"],str) or row["path"] in resources or not isinstance(row["size"],int) or row["size"]<0 or not isinstance(row["sha256"],str) or not re.fullmatch(r"[0-9a-f]{64}",row["sha256"]):
+            return {"pass":False,"reason":"bundle-resource-manifest-invalid"}
+        resources[row["path"]]=row
+    projects=[]
+    for relative in paths:
+        if Path(relative).suffix.lower() in {".md",".markdown"}: continue
+        proof=_project_metadata_containment_evidence(relative,parent_head,commit_head)
+        if proof.get("pass") is not True: return {"pass":False,"reason":"project-containment-unproven"}
+        for binding in proof["resource_bindings"]:
+            destination=binding["bundle_path"]
+            if binding["sign"]=="-":
+                if any(Path(x).name==destination for x in resources): return {"pass":False,"reason":"removed-resource-still-in-bundle"}
+                continue
+            source=binding["source_path"]
+            prior=committed_blob_bytes(parent_head if parent_head and commit_head else resolve_ref("HEAD"),source)
+            if parent_head and commit_head:
+                body=committed_blob_bytes(commit_head,source)
+            else:
+                p=REPO/source
+                if p.is_symlink() or not p.is_file() or p.stat().st_size>8*1024*1024: return {"pass":False,"reason":"resource-source-unsafe"}
+                try: p.resolve().relative_to(REPO.resolve())
+                except ValueError: return {"pass":False,"reason":"resource-source-escapes-repo"}
+                body=p.read_bytes()
+            expected=resources.get(destination)
+            if body is None or prior is None or body!=prior: return {"pass":False,"reason":"resource-content-changed-or-not-tracked"}
+            if expected is None or expected["size"]!=len(body) or expected["sha256"]!=hashlib.sha256(body).hexdigest(): return {"pass":False,"reason":"resource-source-bundle-digest-mismatch"}
+        projects.append({"path":relative,"project_diff_digest":proof["project_diff_digest"]})
+    if not projects: return {"pass":False,"reason":"project-integrity-path-missing"}
+    result={"pass":True,"reason":"full-project-semantics-and-exact-resource-content-proven","projects":projects,"resource_manifest_sha256":build["resource_manifest_sha256"],"bundle_executable_sha256":build.get("bundle_executable_sha256")}
+    result["evidence_digest"]=hashlib.sha256(json.dumps(result,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+    return result
+
+
+def _publication_static_modes_safe(relative: str, parent_head: str | None = None, commit_head: str | None = None) -> bool:
+    """Executable bits, links, and type ambiguity cannot authorize a static exception."""
+    try:
+        def tree_mode(ref):
+            raw = run_git("ls-tree", "-z", ref, "--", ":(literal)" + relative, strip=False)
+            if not raw:
+                return None
+            rows = raw.split("\0")
+            if len(rows) != 2 or rows[1] or "\t" not in rows[0]:
+                raise ValueError("tree-mode-ambiguous")
+            meta, name = rows[0].split("\t", 1)
+            fields = meta.split()
+            if name != relative or len(fields) != 3 or fields[1] != "blob":
+                raise ValueError("tree-entry-ambiguous")
+            return fields[0]
+        before = tree_mode(parent_head if parent_head and commit_head else resolve_ref("HEAD"))
+        if parent_head and commit_head:
+            after = tree_mode(commit_head)
+        else:
+            path = REPO / relative
+            if path.is_symlink():
+                return False
+            if path.exists():
+                mode = path.lstat().st_mode
+                if not stat.S_ISREG(mode):
+                    return False
+                after = "100755" if mode & 0o111 else "100644"
+            else:
+                after = None
+        return before in {None, "100644"} and after in {None, "100644"} and not (before is None and after is None)
+    except Exception:
+        return False
+
+
+def publication_candidate_class(paths: list[str], *, parent_head: str | None = None, commit_head: str | None = None) -> str:
+    if not paths:
+        return "test_executing"
+    strongest = "documentation_static"
+    for relative in paths:
+        if not _publication_static_modes_safe(relative, parent_head, commit_head):
+            return "test_executing"
+        suffix = Path(relative).suffix.casefold()
+        if suffix in _DOCUMENTATION_SUFFIXES:
+            continue
+        if Path(relative).name == "project.pbxproj" and _project_metadata_containment_only(relative, parent_head, commit_head):
+            strongest = "project_integrity_compile"
+            continue
+        return "test_executing"
+    return strongest
+
+
+def publication_validation_class(bound: dict[str, Any] | None, static_evidence: dict[str, Any] | None = None) -> str:
+    strongest = "none"
+    if isinstance(static_evidence, dict) and static_evidence.get("pass") is True and static_evidence.get("state_bound") is True:
+        strongest = "documentation_static"
+    if isinstance(bound, dict) and bound.get("exit_code") == 0 and bound.get("repository_mutated") is False:
+        intent = bound.get("validation_intent")
+        operation = bound.get("operation")
+        if intent == "execute_tests" and operation in {"test-focused", "test-full", "cycle-close"}:
+            return "test_executing"
+        if intent == "compile_only" and operation in {"build-debug", "build-release"}:
+            return "project_integrity_compile"
+    return strongest
+
+
+def evaluate_publication_eligibility(paths: list[str], bound: dict[str, Any] | None, *, parent_head: str | None = None, commit_head: str | None = None, static_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+    candidate = publication_candidate_class(paths, parent_head=parent_head, commit_head=commit_head)
+    validation = publication_validation_class(bound, static_evidence)
+    required = candidate
+    rank_eligible = _PUBLICATION_CLASS_RANK.get(validation, 0) >= _PUBLICATION_CLASS_RANK[required]
+    project_evidence = _project_integrity_evidence(paths, bound, parent_head=parent_head, commit_head=commit_head) if candidate == "project_integrity_compile" else None
+    eligible = rank_eligible and (project_evidence is None or project_evidence.get("pass") is True)
+    if eligible:
+        reason = f"validation class {validation} satisfies mechanically derived {required} requirement"
+    elif candidate == "project_integrity_compile" and isinstance(project_evidence, dict) and project_evidence.get("pass") is not True:
+        reason = "project integrity proof failed: " + str(project_evidence.get("reason") or "unknown")
+    elif validation == "none":
+        reason = f"no successful state-bound validation class satisfies required {required}"
+    else:
+        reason = f"validation class {validation} is weaker than required {required}"
+    return {
+        "candidate_class": candidate,
+        "validation_class": validation,
+        "required_class": required,
+        "publication_eligible": eligible,
+        "reason": reason,
+        "policy_revision": PUBLICATION_POLICY_REVISION,
+        "project_integrity_evidence": project_evidence,
+    }
+
+
+def _whitespace_semantics(relative: str, blob: bytes) -> dict[str, Any]:
+    try:
+        text=blob.decode("utf-8")
+    except UnicodeDecodeError:
+        if Path(relative).suffix.lower() in _TEXT_HYGIENE_SUFFIXES:
+            return {"violations":[],"semantic_exceptions":[],"ambiguous":True,"ambiguity":"text-encoding-ambiguous"}
+        return {"violations":[],"semantic_exceptions":[],"ambiguous":False}
+    if "\x00" in text:
+        if Path(relative).suffix.lower() in _TEXT_HYGIENE_SUFFIXES:
+            return {"violations":[],"semantic_exceptions":[],"ambiguous":True,"ambiguity":"text-contains-nul"}
+        return {"violations":[],"semantic_exceptions":[],"ambiguous":False}
+    if "\r" in text.replace("\r\n",""):
+        return {"violations":[],"semantic_exceptions":[],"ambiguous":True,"ambiguity":"line-ending-ambiguous"}
+    markdown=Path(relative).suffix.lower() in {".md",".markdown"}
+    approved=set()
+    if markdown and re.search(r"  \r?\n",text):
+        try: approved=_markdown_hardbreak_lines(text)
+        except Exception:
+            return {"violations":[],"semantic_exceptions":[],"ambiguous":True,"ambiguity":"markdown-semantics-unproven"}
+    violations=[]; exceptions=[]
+    for number,body in enumerate(text.replace("\r\n","\n").split("\n"),1):
+        m=re.search(r"[ \t]+$",body)
+        if not m: continue
+        tail=m.group(0); row={"path":relative,"line":number}
+        if markdown and tail=="  " and number in approved:
+            exceptions.append({**row,"category":"markdown-hard-break-two-spaces","semantic_contract":"commonmark-0.31.2/markdown-it-py-4.2.0"})
+        else:
+            category="mixed-tab-space-ending" if "\t" in tail and " " in tail else "trailing-tab" if "\t" in tail else "trailing-space-one" if len(tail)==1 else "trailing-spaces-excess" if len(tail)>=3 else "markdown-trailing-spaces-not-hard-break" if markdown else "trailing-whitespace"
+            violations.append({**row,"category":category})
+    return {"violations":violations,"semantic_exceptions":exceptions,"ambiguous":False}
+
+
+def scan_worktree_candidates(paths: list[str], expected_worktree_fingerprint: str) -> dict[str, Any]:
+    violations: list[dict[str, Any]] = []
+    suspicious: list[dict[str, Any]] = []
+    semantic_exceptions: list[dict[str, Any]] = []
+    private_path_markers = ("LEDGERFORGE_AXIS_CARD_PRIVATE_PASSWORD=", "LEDGERFORGE_AXIS_CARD_PRIVATE_DIRECTORY=", "LEDGERFORGE_PRIVATE_AMEX_DIRECTORY=", "LEDGERFORGE_PRIVATE_CBQ_TEXT_DIRECTORY=", "LEDGERFORGE_PRIVATE_HDFC_ORIGINALS_ROOT=")
     known_secret_values = current_secret_values()
     try:
-        if axis_keychain_available():
+        if axis_keychain_available(): known_secret_values.append(keychain_axis_password())
+    except Exception:
+        pass
+    try:
+        for relative in paths:
+            _, candidate = normalize_repo_write_path(relative)
+            category = _privacy_path_violation(relative)
+            if category:
+                violations.append({"path": relative, "category": category}); continue
+            if not candidate.is_file() or candidate.is_symlink():
+                suspicious.append({"path": relative, "category": "candidate-not-ordinary-file"}); continue
+            if candidate.stat().st_size > 8 * 1024 * 1024:
+                suspicious.append({"path": relative, "category": "candidate-size-bound-exceeded"}); continue
+            blob = candidate.read_bytes()
+            whitespace = _whitespace_semantics(relative, blob)
+            violations.extend(whitespace.get("violations", [])); semantic_exceptions.extend(whitespace.get("semantic_exceptions", []))
+            if whitespace.get("ambiguous"):
+                suspicious.append({"path": relative, "category": whitespace.get("ambiguity", "whitespace-semantics-ambiguous")}); continue
+            text = blob.decode("utf-8", errors="ignore")
+            if any(marker and marker in text for marker in private_path_markers):
+                violations.append({"path": relative, "category": "private-path-or-environment-marker"}); continue
+            if any(secret and secret.encode("utf-8", errors="ignore") in blob for secret in known_secret_values):
+                violations.append({"path": relative, "category": "known-secret-value"})
+    finally:
+        known_secret_values.clear()
+    current = worktree_fingerprint(); state_bound = current == expected_worktree_fingerprint
+    if not state_bound: suspicious.append({"path": "[worktree]", "category": "worktree-fingerprint-changed"})
+    return {"scope": "worktree-candidates", "paths": paths, "violations": violations, "semantic_exceptions": semantic_exceptions, "suspicious": suspicious, "state_bound": state_bound, "worktree_fingerprint": current, "pass": not violations and not suspicious}
+
+
+def scan_committed_blobs(parent_head: str, commit_head: str, max_paths: int = 100) -> dict[str, Any]:
+    """Scan the immutable blobs changed by one candidate commit.
+
+    This is deliberately separate from ``scan_staged_blobs``: an interrupted
+    publication has an empty index, so scanning the index would provide no
+    evidence about the already-created commit. The result contains only path
+    categories and hashes/counts; no blob or credential values are returned.
+    """
+    rows = commit_diff_rows(parent_head, commit_head)
+    violations: list[dict[str, Any]] = []
+    suspicious: list[dict[str, Any]] = []
+    semantic_exceptions: list[dict[str, Any]] = []
+    if len(rows) > max_paths:
+        suspicious.append({"path": "[commit-path-set]", "category": "changed-path-count-exceeded"})
+    known_secret_values = current_secret_values()
+    try:
+        if IS_LEDGERFORGE and axis_keychain_available():
+            known_secret_values.append(keychain_axis_password())
+    except Exception:
+        pass
+    private_path_markers = (
+        str(Path.home() / "Documents" / "Ledger Forge" / "Originals"),
+        "LEDGERFORGE_AXIS_CARD_PRIVATE_PASSWORD=",
+        "LEDGERFORGE_AXIS_CARD_PRIVATE_DIRECTORY=",
+        "LEDGERFORGE_PRIVATE_AMEX_DIRECTORY=",
+        "LEDGERFORGE_PRIVATE_CBQ_TEXT_DIRECTORY=",
+        "LEDGERFORGE_PRIVATE_HDFC_ORIGINALS_ROOT=",
+    )
+    try:
+        for row in rows[:max_paths]:
+            relative = row["path"]
+            category = _privacy_path_violation(relative)
+            if category:
+                violations.append({"path": relative, "category": category})
+                continue
+            # A deleted path has no outgoing blob. Its path was still checked
+            # above; there is no content to scan after deletion.
+            if row["status"] == "D":
+                continue
+            blob = committed_blob_bytes(commit_head, relative)
+            if blob is None:
+                suspicious.append({"path": relative, "category": "blob-too-large-or-unreadable"})
+                continue
+            whitespace = _whitespace_semantics(relative, blob)
+            violations.extend(whitespace.get("violations", []))
+            semantic_exceptions.extend(whitespace.get("semantic_exceptions", []))
+            if whitespace.get("ambiguous"):
+                suspicious.append({"path": relative, "category": whitespace.get("ambiguity", "whitespace-semantics-ambiguous")})
+                continue
+            text = blob.decode("utf-8", errors="ignore")
+            if any(marker and marker in text for marker in private_path_markers):
+                violations.append({"path": relative, "category": "private-path-or-environment-marker"})
+                continue
+            if any(secret and secret.encode("utf-8", errors="ignore") in blob for secret in known_secret_values):
+                violations.append({"path": relative, "category": "known-secret-value"})
+    finally:
+        known_secret_values.clear()
+    return {
+        "scope": "commit-diff",
+        "parent_head": parent_head,
+        "commit_head": commit_head,
+        "changed_paths": [row["path"] for row in rows],
+        "changed_path_count": len(rows),
+        "scanned_path_count": min(len(rows), max_paths),
+        "violations": violations,
+        "semantic_exceptions": semantic_exceptions,
+        "suspicious": suspicious,
+        "pass": not violations and not suspicious,
+        "financial_sanitization_proven": False,
+    }
+
+
+def publication_relationship(origin_main: str, head: str) -> dict[str, Any]:
+    """Prove the managed one-commit fast-forward relationship for adoption."""
+    counts = run_git("rev-list", "--left-right", "--count", f"{publication_branch()}...{publication_tracking_ref()}").split()
+    if len(counts) != 2:
+        raise RuntimeError("Unable to determine main/origin-main relationship.")
+    ahead, behind = int(counts[0]), int(counts[1])
+    if head == origin_main:
+        raise RuntimeError("HEAD already equals origin/main; no publication candidate exists.")
+    if behind != 0:
+        raise RuntimeError("origin/main is ahead or history has diverged; publication adoption refused.")
+    if ahead != 1:
+        raise RuntimeError("Publication adoption requires exactly one local commit ahead of origin/main.")
+    ancestor = subprocess.run(
+        ["git", "-C", str(REPO), "merge-base", "--is-ancestor", origin_main, head],
+        capture_output=True, text=True, env=git_env(), check=False, timeout=10,
+    )
+    if ancestor.returncode != 0:
+        raise RuntimeError("origin/main is not an ancestor of HEAD; history is not a safe fast-forward.")
+    parent = commit_parent_sha(head)
+    if parent != origin_main:
+        raise RuntimeError("Publication adoption requires HEAD's parent to equal origin/main.")
+    return {
+        "origin_main": origin_main,
+        "head": head,
+        "ahead": ahead,
+        "behind": behind,
+        "origin_is_ancestor": True,
+        "parent_head": parent,
+        "tree_sha": commit_tree_sha(head),
+    }
+
+
+def scan_staged_blobs(max_paths: int = 100) -> dict[str, Any]:
+    paths = staged_paths()
+    violations: list[dict[str, Any]] = []
+    suspicious: list[dict[str, Any]] = []
+    semantic_exceptions: list[dict[str, Any]] = []
+    known_secret_values = current_secret_values()
+    try:
+        if IS_LEDGERFORGE and axis_keychain_available():
             known_secret_values.append(keychain_axis_password())
     except Exception:
         pass
     forbidden_fragments = (
-        ".executor-token", ".executor-path", ".mcp-path", "DerivedData", ".xcresult",
+        ".executor-path", ".mcp-path", ".executor-secret-refs.json", "ledgerforge-runtime-key",
+    "ledgerforge-admin-auth-header", "ledgerforge-recovery.yaml", "ledgerforge-recovery-admin.yaml",
+    ".executor-token", ".executor-path", ".mcp-path", "DerivedData", ".xcresult",
         "xcuserdata", ".sqlite-wal", ".sqlite-shm",
     )
     forbidden_suffixes = (".sqlite", ".sqlite3", ".db", ".p12", ".pfx", ".pem", ".key")
@@ -5766,6 +6874,8 @@ def scan_staged_blobs(max_paths: int = 100) -> dict[str, Any]:
         "LEDGERFORGE_PRIVATE_CBQ_TEXT_DIRECTORY=",
         "LEDGERFORGE_PRIVATE_HDFC_ORIGINALS_ROOT=",
     )
+    if len(paths) > max_paths:
+        suspicious.append({"path": "[staged-path-set]", "category": "staged-path-count-exceeded"})
     for relative in paths[:max_paths]:
         low = relative.casefold()
         if any(fragment.casefold() in low for fragment in forbidden_fragments) or any(low.endswith(s.casefold()) for s in forbidden_suffixes):
@@ -5774,6 +6884,12 @@ def scan_staged_blobs(max_paths: int = 100) -> dict[str, Any]:
         blob = staged_blob_bytes(relative)
         if blob is None:
             suspicious.append({"path": relative, "category": "blob-too-large-or-unreadable"})
+            continue
+        whitespace = _whitespace_semantics(relative, blob)
+        violations.extend(whitespace.get("violations", []))
+        semantic_exceptions.extend(whitespace.get("semantic_exceptions", []))
+        if whitespace.get("ambiguous"):
+            suspicious.append({"path": relative, "category": whitespace.get("ambiguity", "whitespace-semantics-ambiguous")})
             continue
         text = blob.decode("utf-8", errors="ignore")
         if any(marker and marker in text for marker in private_path_markers):
@@ -5787,40 +6903,73 @@ def scan_staged_blobs(max_paths: int = 100) -> dict[str, Any]:
         "staged_paths": paths,
         "scanned_path_count": min(len(paths), max_paths),
         "violations": violations,
+        "semantic_exceptions": semantic_exceptions,
         "suspicious": suspicious,
-        "pass": not violations,
+        "pass": not violations and not suspicious,
         "financial_sanitization_proven": False,
     }
 
 
-def update_lease_after_stage(lease_id: str, lease_token: str) -> dict[str, Any]:
+def update_lease_after_stage(lease_id: str, lease_token: str, publication_policy: dict[str, Any], static_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
     lease = require_execution_lease(lease_id, lease_token)
-    bound = validate_bound_state_for_publication(lease, require_success=True)
+    if publication_policy.get("publication_eligible") is not True:
+        raise RuntimeError("Ineligible publication policy may not be bound after staging.")
+    if publication_policy.get("validation_class") == "documentation_static":
+        if not isinstance(static_evidence, dict) or static_evidence.get("pass") is not True or static_evidence.get("state_bound") is not True:
+            raise RuntimeError("Documentation-static publication lacks exact static evidence.")
+        if static_evidence.get("worktree_fingerprint") != worktree_fingerprint():
+            raise RuntimeError("Documentation-static evidence no longer matches the worktree.")
+        bound = None
+    else:
+        bound = validate_bound_state_for_publication(lease, require_success=True)
     with _lease_lock:
         lease = read_active_lease_raw() or lease
         lease["validated_stage"] = {
-            "validation_run_id": bound.get("run_id"),
+            "validation_run_id": bound.get("run_id") if isinstance(bound, dict) else None,
             "index_fingerprint": index_fingerprint(),
             "staged_paths": staged_paths(),
             "worktree_fingerprint": worktree_fingerprint(),
+            "publication_policy": publication_policy,
+            "static_evidence": static_evidence,
+            "static_evidence_digest": sha256_text(json.dumps(static_evidence, sort_keys=True, separators=(",", ":"))) if isinstance(static_evidence, dict) else None,
             "bound_at": now_iso(),
         }
         atomic_write_json(LEASE_FILE, lease)
     return lease
-
 
 def update_lease_after_commit(lease_id: str, lease_token: str, previous_head: str, new_head: str) -> dict[str, Any]:
     lease = require_execution_lease(lease_id, lease_token)
     stage = lease.get("validated_stage")
     if not isinstance(stage, dict):
         raise RuntimeError("No validated staged state is bound to this lease.")
+    previous_head = require_commit_sha(previous_head, "previous_head")
+    new_head = require_commit_sha(new_head, "new_head")
+    if resolve_ref("HEAD") != new_head:
+        raise RuntimeError("Committed HEAD changed before the publication candidate was recorded.")
+    candidate_worktree = worktree_fingerprint()
+    candidate_index = index_fingerprint()
+    expected_origin = resolve_ref(publication_tracking_ref())
+    if expected_origin is None:
+        raise RuntimeError("Cannot record a publication candidate without origin/main.")
+    parent = commit_parent_sha(new_head)
+    if parent != previous_head:
+        raise RuntimeError("Committed publication candidate parent does not match the expected previous HEAD.")
     with _lease_lock:
         lease = read_active_lease_raw() or lease
         lease["publication_candidate"] = {
+            "schema": "publication-candidate-v2",
+            "source": "same-lease-commit",
             "previous_head": previous_head,
             "commit_head": new_head,
+            "parent_head": parent,
+            "tree_sha": commit_tree_sha(new_head),
+            "expected_origin_main": expected_origin,
             "validation_run_id": stage.get("validation_run_id"),
             "committed_paths": stage.get("staged_paths", []),
+            "publication_policy": stage.get("publication_policy"),
+            "static_evidence_digest": stage.get("static_evidence_digest"),
+            "candidate_worktree_fingerprint": candidate_worktree,
+            "candidate_index_fingerprint": candidate_index,
             "created_at": now_iso(),
         }
         atomic_write_json(LEASE_FILE, lease)
@@ -5832,13 +6981,71 @@ def update_lease_after_commit(lease_id: str, lease_token: str, previous_head: st
 
 def ensure_git_mutation_preconditions(expected_head: str) -> None:
     require_expected_head(expected_head)
-    if run_git("branch", "--show-current") != "main":
-        raise RuntimeError("Git mutations are permitted only on main.")
+    if run_git("branch", "--show-current") != publication_branch():
+        raise RuntimeError("Check out the selected repository’s publication branch first.")
     if conflicted_paths():
         raise RuntimeError("Git mutation refused while conflicts exist.")
     operation = active_git_operation()
     if operation:
         raise RuntimeError(f"Git mutation refused during active {operation} operation.")
+
+
+def require_adoption_validation(
+    lease: dict[str, Any],
+    validation_run_id: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Require durable, successful, current executing-test validation evidence.
+
+    A normal publication flow uses the validation binding recorded on the
+    current lease.  Recovery after a client/execution-lease interruption may
+    explicitly name a previously completed durable validation run instead.
+    That handoff is still fail-closed: the run must be a successful executing
+    test, and its recorded HEAD/worktree/index must match the current checkout
+    exactly before adoption can proceed.  The caller cannot supply a summary
+    or fingerprints in lieu of the durable run record.
+    """
+    existing_bound = lease.get("validated_state")
+    if validation_run_id is not None:
+        if not isinstance(validation_run_id, str) or not re.fullmatch(UUID_PATTERN, validation_run_id):
+            raise ValueError("validation_run_id must be a durable validation UUID.")
+        if isinstance(existing_bound, dict):
+            if existing_bound.get("run_id") != validation_run_id:
+                raise RuntimeError("Requested validation_run_id differs from the lease-bound validation.")
+            bound = validate_bound_state_for_publication(lease, require_success=True)
+        else:
+            state_for_binding = read_state(validation_run_id)
+            bound = {
+                "run_id": validation_run_id,
+                "head": state_for_binding.get("ending_head"),
+                "worktree_fingerprint": state_for_binding.get("ending_worktree_fingerprint"),
+                "index_fingerprint": state_for_binding.get("ending_index_fingerprint"),
+                "exit_code": state_for_binding.get("exit_code"),
+                "repository_mutated": state_for_binding.get("repository_mutated"),
+                "failure_classification": state_for_binding.get("failure_classification"),
+                "operation": state_for_binding.get("operation"),
+                "validation_intent": state_for_binding.get("validation_intent"),
+                "publication_eligible": state_for_binding.get("publication_eligible", True),
+                "bound_at": now_iso(),
+                "binding_source": "explicit-durable-validation-run",
+            }
+    else:
+        bound = validate_bound_state_for_publication(lease, require_success=True)
+    run_id = bound.get("run_id")
+    if not isinstance(run_id, str) or not re.fullmatch(UUID_PATTERN, run_id):
+        raise RuntimeError("Validated publication state has no durable validation run identity.")
+    state = read_state(run_id)
+    if state.get("status") != "completed":
+        raise RuntimeError("Publication adoption requires a completed validation run.")
+    if state.get("exit_code") != 0 or state.get("repository_mutated") is not False:
+        raise RuntimeError("Publication adoption requires successful non-mutating validation.")
+    current_head = resolve_ref("HEAD")
+    current_worktree = worktree_fingerprint()
+    current_index = index_fingerprint()
+    if state.get("ending_head") != current_head or state.get("ending_worktree_fingerprint") != current_worktree or state.get("ending_index_fingerprint") != current_index:
+        raise RuntimeError("Validation evidence no longer matches the current repository state.")
+    if bound.get("run_id") != state.get("run_id") or bound.get("head") != current_head or bound.get("worktree_fingerprint") != current_worktree or bound.get("index_fingerprint") != current_index:
+        raise RuntimeError("Lease-bound validation evidence does not match the current repository state.")
+    return bound, state
 
 
 @tool(read_only=False, destructive=False, idempotent=True, open_world=True)
@@ -5852,7 +7059,7 @@ def git_fetch_origin(operation_id: UUIDString, expected_head: str, lease_id: UUI
         require_execution_lease(lease_id, lease_token)
         ensure_git_mutation_preconditions(expected_head)
         require_expected_origin_identity()
-        before = resolve_ref("origin/main")
+        before = resolve_ref(publication_tracking_ref())
         before_fingerprint = worktree_fingerprint()
         with _git_mutation_lock:
             run_git("fetch", "origin", mutating=True, timeout=120)
@@ -5863,7 +7070,7 @@ def git_fetch_origin(operation_id: UUIDString, expected_head: str, lease_id: UUI
             "lease_id": lease_id,
             "head": resolve_ref("HEAD"),
             "origin_main_before": before,
-            "origin_main_after": resolve_ref("origin/main"),
+            "origin_main_after": resolve_ref(publication_tracking_ref()),
             "remote_identity": require_expected_origin_identity(),
             "worktree_unchanged": True,
             "fetched_at": now_iso(),
@@ -5903,8 +7110,8 @@ def git_stage(
         require_worktree_fingerprint(expected_worktree_fingerprint)
         if index_fingerprint() != expected_index_fingerprint:
             raise RuntimeError("Index changed since staging was planned.")
-        if not paths:
-            raise ValueError("At least one exact path is required.")
+        if not paths or len(paths) > 100:
+            raise ValueError("Between one and 100 exact paths are required.")
         normalized: list[str] = []
         for raw in paths:
             if raw in {".", "-A", "--all", "*"} or raw.startswith("-"):
@@ -5912,26 +7119,36 @@ def git_stage(
             relative, candidate = normalize_repo_write_path(raw)
             if not candidate.exists() and relative not in tracked_paths():
                 raise FileNotFoundError(f"Path is neither present nor a tracked deletion: {relative}")
+            if candidate.exists() and (candidate.is_symlink() or not candidate.is_file()):
+                raise PermissionError("Stage requires an exact ordinary file, not a directory or symlink.")
             normalized.append(relative)
         if len(normalized) != len(set(normalized)):
             raise ValueError("Duplicate stage paths are not permitted.")
+        if set(staged_paths()) - set(normalized):
+            raise RuntimeError("All pre-staged paths must be included for complete effect classification.")
+        candidate_class = publication_candidate_class(normalized)
+        static_evidence = scan_worktree_candidates(normalized, expected_worktree_fingerprint) if candidate_class == "documentation_static" else None
+        bound = lease.get("validated_state") if isinstance(lease.get("validated_state"), dict) else None
+        if candidate_class == "documentation_static":
+            bound = None
+        else:
+            bound = validate_bound_state_for_publication(lease, require_success=False)
+        publication_policy = evaluate_publication_eligibility(normalized, bound, static_evidence=static_evidence)
+        diagnostics = {**publication_policy, "static_evidence": static_evidence}
         if dry_run:
-            return finish_operation(operation_id, {
-                "dry_run": True,
-                "lease_id": lease_id,
-                "head": resolve_ref("HEAD"),
-                "paths": normalized,
-                "index_fingerprint": expected_index_fingerprint,
-                "validation_bound": isinstance(lease.get("validated_state"), dict),
-            })
-        validate_bound_state_for_publication(lease, require_success=True)
+            return finish_operation(operation_id, {"dry_run": True, "lease_id": lease_id, "head": resolve_ref("HEAD"), "paths": normalized, "index_fingerprint": expected_index_fingerprint, **diagnostics})
+        if publication_policy["publication_eligible"] is not True:
+            raise RuntimeError("Publication eligibility denied: " + publication_policy["reason"])
+        if candidate_class != "documentation_static":
+            validate_bound_state_for_publication(lease, require_success=True, paths=normalized)
         with _git_mutation_lock:
             require_expected_head(expected_head)
             require_worktree_fingerprint(expected_worktree_fingerprint)
             if index_fingerprint() != expected_index_fingerprint:
                 raise RuntimeError("Index changed immediately before staging.")
-            run_git("add", "--", *normalized, mutating=True)
-        lease = update_lease_after_stage(lease_id, lease_token)
+            run_git("add", "--", *[":(literal)" + path for path in normalized], mutating=True)
+            require_worktree_fingerprint(expected_worktree_fingerprint)
+        lease = update_lease_after_stage(lease_id, lease_token, publication_policy, static_evidence)
         return finish_operation(operation_id, {
             "dry_run": False,
             "lease_id": lease_id,
@@ -5941,6 +7158,8 @@ def git_stage(
             "index_fingerprint_after": index_fingerprint(),
             "worktree_fingerprint": worktree_fingerprint(),
             "validation_run_id": (lease.get("validated_stage") or {}).get("validation_run_id"),
+            **publication_policy,
+            "static_evidence": static_evidence,
         })
     except Exception as exc:
         fail_operation(operation_id, exc)
@@ -5998,6 +7217,10 @@ def git_commit(
             raise RuntimeError("Staged state is not bound to a successful validation.")
         if stage_binding.get("index_fingerprint") != actual_index or sorted(stage_binding.get("staged_paths", [])) != actual_staged:
             raise RuntimeError("Current staged index differs from the validated staging binding.")
+        if stage_binding.get("worktree_fingerprint") != worktree_fingerprint():
+            raise RuntimeError("Worktree changed after the publication evidence was bound.")
+        if (stage_binding.get("publication_policy") or {}).get("publication_eligible") is not True:
+            raise RuntimeError("Staged publication policy is not eligible.")
         scan = scan_staged_blobs()
         if not scan.get("pass"):
             raise RuntimeError("Pre-commit privacy/residue scan failed.")
@@ -6010,6 +7233,7 @@ def git_commit(
                 "index_fingerprint": actual_index,
                 "privacy_scan": scan,
                 "validation_run_id": stage_binding.get("validation_run_id"),
+                **(stage_binding.get("publication_policy") or {}),
             })
         with _git_mutation_lock:
             ensure_git_mutation_preconditions(expected_head)
@@ -6029,8 +7253,197 @@ def git_commit(
             "remaining_untracked_files": sorted(untracked_paths()),
             "privacy_scan_passed": True,
             "validation_run_id": stage_binding.get("validation_run_id"),
+            **(stage_binding.get("publication_policy") or {}),
         }
         return finish_operation(operation_id, result)
+    except Exception as exc:
+        fail_operation(operation_id, exc)
+        raise
+
+
+@tool(read_only=False, destructive=False, idempotent=True, open_world=True)
+def adopt_publication_candidate(
+    operation_id: UUIDString,
+    expected_head: str,
+    expected_worktree_fingerprint: str,
+    expected_index_fingerprint: str,
+    expected_origin_main: str,
+    lease_id: UUIDString,
+    lease_token: str,
+    validation_run_id: UUIDString | None = None,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Adopt one already-committed, freshly validated fast-forward commit.
+
+    Adoption is an explicit recovery capability. It never creates or rewrites
+    a commit, stages files, changes the worktree/index/HEAD, or pushes. A fresh
+    origin fetch is performed under this lease so the resulting candidate is
+    bound to current remote state before ``git_push`` may use it.
+    """
+    payload = {
+        "expected_head": expected_head,
+        "expected_worktree_fingerprint": expected_worktree_fingerprint,
+        "expected_index_fingerprint": expected_index_fingerprint,
+        "expected_origin_main": expected_origin_main,
+        "lease_id": lease_id,
+        "validation_run_id": validation_run_id,
+        "dry_run": dry_run,
+    }
+    replay, prior = begin_operation(operation_id, "adopt_publication_candidate", payload)
+    if replay:
+        return prior
+    try:
+        expected_head = require_commit_sha(expected_head, "expected_head")
+        expected_origin_main = require_commit_sha(expected_origin_main, "expected_origin_main")
+        expected_worktree_fingerprint = require_fingerprint(expected_worktree_fingerprint, "expected_worktree_fingerprint")
+        expected_index_fingerprint = require_fingerprint(expected_index_fingerprint, "expected_index_fingerprint")
+        if validation_run_id is not None:
+            validation_run_id = _require_uuid(validation_run_id, "validation_run_id")
+        lease = require_execution_lease(lease_id, lease_token, extend_seconds=DEFAULT_LEASE_SECONDS)
+        ensure_git_mutation_preconditions(expected_head)
+        if resolve_ref(publication_branch()) != expected_head:
+            raise RuntimeError("HEAD must equal local main for publication adoption.")
+        if staged_paths():
+            raise RuntimeError("Publication adoption requires zero staged paths.")
+        require_worktree_fingerprint(expected_worktree_fingerprint)
+        if index_fingerprint() != expected_index_fingerprint:
+            raise RuntimeError("Index changed before publication adoption.")
+        bound, validation = require_adoption_validation(lease, validation_run_id)
+        identity_before = require_expected_origin_identity()
+        before_head = resolve_ref("HEAD")
+        before_main = resolve_ref(publication_branch())
+        before_worktree = worktree_fingerprint()
+        before_index = index_fingerprint()
+        origin_before = resolve_ref(publication_tracking_ref())
+
+        with _git_mutation_lock:
+            # Recheck the lease and all caller-bound state immediately before
+            # the fetch; an intervening mutation must fail closed.
+            lease = require_execution_lease(lease_id, lease_token, extend_seconds=DEFAULT_LEASE_SECONDS)
+            ensure_git_mutation_preconditions(expected_head)
+            if resolve_ref(publication_branch()) != expected_head or staged_paths():
+                raise RuntimeError("Repository state changed before publication adoption.")
+            require_worktree_fingerprint(expected_worktree_fingerprint)
+            if index_fingerprint() != expected_index_fingerprint:
+                raise RuntimeError("Index changed before publication adoption.")
+            bound, validation = require_adoption_validation(lease, validation_run_id)
+            identity_after = require_expected_origin_identity()
+            if identity_after != identity_before:
+                raise RuntimeError("origin identity changed during publication adoption.")
+            run_git("fetch", "origin", mutating=True, timeout=120)
+            require_execution_lease(lease_id, lease_token, extend_seconds=DEFAULT_LEASE_SECONDS)
+            ensure_git_mutation_preconditions(expected_head)
+            if resolve_ref(publication_branch()) != expected_head or staged_paths():
+                raise RuntimeError("Repository state changed during origin fetch.")
+            if worktree_fingerprint() != before_worktree or index_fingerprint() != before_index:
+                raise RuntimeError("Worktree or index changed during origin fetch.")
+            if resolve_ref("HEAD") != before_head or resolve_ref(publication_branch()) != before_main:
+                raise RuntimeError("HEAD or main changed during origin fetch.")
+            identity_after_fetch = require_expected_origin_identity()
+            if identity_after_fetch != identity_before:
+                raise RuntimeError("origin identity changed after origin fetch.")
+            actual_origin = resolve_ref(publication_tracking_ref())
+            if actual_origin != expected_origin_main:
+                raise RuntimeError(f"origin/main differs from expected fetched state. Expected={expected_origin_main}, actual={actual_origin}")
+            relationship = publication_relationship(expected_origin_main, expected_head)
+            parent_head = relationship["parent_head"]
+            tree_sha = relationship["tree_sha"]
+            privacy_scan = scan_committed_blobs(parent_head, expected_head)
+            if privacy_scan.get("pass") is not True:
+                raise RuntimeError("Commit privacy/residue scan failed.")
+            publication_policy = evaluate_publication_eligibility(privacy_scan.get("changed_paths", []), bound, parent_head=parent_head, commit_head=expected_head)
+            if not dry_run and publication_policy["publication_eligible"] is not True:
+                raise RuntimeError("Publication eligibility denied: " + publication_policy["reason"])
+            current_worktree = worktree_fingerprint()
+            current_index = index_fingerprint()
+            if current_worktree != expected_worktree_fingerprint or current_index != expected_index_fingerprint:
+                raise RuntimeError("Repository fingerprints changed during publication adoption.")
+            candidate = {
+                "schema": "publication-candidate-v2",
+                "source": "adopted-existing-commit",
+                "previous_head": parent_head,
+                "parent_head": parent_head,
+                "commit_head": expected_head,
+                "tree_sha": tree_sha,
+                "expected_origin_main": expected_origin_main,
+                "fresh_origin_main": actual_origin,
+                "validation_run_id": bound.get("run_id"),
+                "validation_binding_source": bound.get("binding_source", "lease-bound"),
+                "validated_head": bound.get("head"),
+                "validated_worktree_fingerprint": bound.get("worktree_fingerprint"),
+                "validated_index_fingerprint": bound.get("index_fingerprint"),
+                "candidate_worktree_fingerprint": current_worktree,
+                "candidate_index_fingerprint": current_index,
+                "committed_paths": privacy_scan.get("changed_paths", []),
+                "committed_paths_source": "git-diff-tree",
+                "publication_policy": publication_policy,
+                "privacy_scan": {
+                    "scope": privacy_scan.get("scope"),
+                    "changed_path_count": privacy_scan.get("changed_path_count"),
+                    "scanned_path_count": privacy_scan.get("scanned_path_count"),
+                    "pass": privacy_scan.get("pass"),
+                    "financial_sanitization_proven": False,
+                    "semantic_exceptions": privacy_scan.get("semantic_exceptions", []),
+                },
+                "adopted_at": now_iso(),
+            }
+            if dry_run:
+                return finish_operation(operation_id, {
+                    "dry_run": True,
+                    "lease_id": lease_id,
+                    "head": expected_head,
+                    "main": resolve_ref(publication_branch()),
+                    "origin_main": actual_origin,
+                    "remote_identity": identity_after_fetch,
+                    "relationship": relationship,
+                    "validation_run_id": bound.get("run_id"),
+                    "privacy_scan": candidate["privacy_scan"],
+                    **publication_policy,
+                    "candidate": candidate,
+                    "publication_candidate": candidate,
+                    "would_adopt": True,
+                    "repository_state_unchanged": True,
+                    "worktree_unchanged": worktree_fingerprint() == before_worktree,
+                    "index_unchanged": index_fingerprint() == before_index,
+                    "head_unchanged": resolve_ref("HEAD") == before_head,
+                    "push_performed": False,
+                })
+            with _lease_lock:
+                current = read_active_lease_raw()
+                if not current or current.get("lease_id") != lease_id:
+                    raise RuntimeError("Execution lease changed before publication adoption was recorded.")
+                if current.get("status") != "active" or lease_is_expired(current):
+                    raise PermissionError("Execution lease expired before publication adoption was recorded.")
+                if validation_run_id is not None and not isinstance(current.get("validated_state"), dict):
+                    # Bind only the exact durable run that was rechecked above;
+                    # callers cannot inject a fabricated validation summary.
+                    current["validated_state"] = bound
+                    current["active_validation_run_id"] = None
+                current["publication_candidate"] = candidate
+                current["publication_candidate_adopted_at"] = candidate["adopted_at"]
+                atomic_write_json(LEASE_FILE, current)
+            result = {
+                "dry_run": False,
+                "lease_id": lease_id,
+                "head": expected_head,
+                "main": resolve_ref(publication_branch()),
+                "origin_main": actual_origin,
+                "remote_identity": identity_after_fetch,
+                "relationship": relationship,
+                "candidate": candidate,
+                "publication_candidate": candidate,
+                "publication_candidate_created": True,
+                "validation_run_id": bound.get("run_id"),
+                "validation_binding_source": bound.get("binding_source", "lease-bound"),
+                "privacy_scan": candidate["privacy_scan"],
+                **publication_policy,
+                "repository_state_unchanged": True,
+                "worktree_unchanged": worktree_fingerprint() == before_worktree,
+                "index_unchanged": index_fingerprint() == before_index,
+                "head_unchanged": resolve_ref("HEAD") == before_head,
+                "push_performed": False,
+            }
+            return finish_operation(operation_id, result)
     except Exception as exc:
         fail_operation(operation_id, exc)
         raise
@@ -6055,8 +7468,14 @@ def git_push(
         ensure_git_mutation_preconditions(expected_head)
         identity = require_expected_origin_identity()
         candidate = lease.get("publication_candidate")
+        candidate_matches_head = (
+            isinstance(candidate, dict)
+            and candidate.get("schema") == "publication-candidate-v2"
+            and candidate.get("source") in {"same-lease-commit", "adopted-existing-commit"}
+            and candidate.get("commit_head") == expected_head
+        )
         if dry_run:
-            actual_origin = resolve_ref("origin/main")
+            actual_origin = resolve_ref(publication_tracking_ref())
             if actual_origin != expected_origin_main:
                 raise RuntimeError(f"origin/main differs from expected local record. Expected={expected_origin_main}, actual={actual_origin}")
             return finish_operation(operation_id, {
@@ -6066,29 +7485,69 @@ def git_push(
                 "origin_main": actual_origin,
                 "remote": "origin",
                 "remote_identity": identity,
-                "refspec": "main:main",
-                "publication_candidate_present": isinstance(candidate, dict),
+                "refspec": f"{publication_branch()}:{publication_branch()}",
+                "publication_candidate_present": candidate_matches_head,
+                "publication_candidate_source": candidate.get("source") if candidate_matches_head else None,
             })
-        if not isinstance(candidate, dict) or candidate.get("commit_head") != expected_head:
+        if not candidate_matches_head:
             raise RuntimeError("HEAD is not the validated publication candidate for this lease.")
+        candidate_expected_origin = candidate.get("expected_origin_main")
+        if candidate_expected_origin != expected_origin_main:
+            raise RuntimeError("Publication candidate expected origin/main differs from the push request.")
+        if candidate.get("parent_head") != expected_origin_main:
+            raise RuntimeError("Publication candidate parent does not equal the expected origin/main.")
+        if candidate.get("tree_sha") != commit_tree_sha(expected_head):
+            raise RuntimeError("Publication candidate tree identity does not match HEAD.")
+        policy = candidate.get("publication_policy") if isinstance(candidate.get("publication_policy"), dict) else {}
+        static_candidate = policy.get("validation_class") == "documentation_static" and policy.get("required_class") == "documentation_static" and policy.get("publication_eligible") is True
+        if not static_candidate and not isinstance(candidate.get("validation_run_id"), str):
+            raise RuntimeError("Publication candidate has no durable validation run identity.")
+        if static_candidate and not isinstance(candidate.get("static_evidence_digest"), str):
+            raise RuntimeError("Documentation-static publication candidate lacks static evidence identity.")
+        candidate_worktree = candidate.get("candidate_worktree_fingerprint")
+        candidate_index = candidate.get("candidate_index_fingerprint")
+        if candidate_worktree is not None and candidate_worktree != worktree_fingerprint():
+            raise RuntimeError("Worktree changed after publication candidate creation.")
+        if candidate_index is not None and candidate_index != index_fingerprint():
+            raise RuntimeError("Index changed after publication candidate creation.")
         before_fingerprint = worktree_fingerprint()
         with _git_mutation_lock:
+            current_lease = require_execution_lease(lease_id, lease_token)
+            current_candidate = current_lease.get("publication_candidate")
+            if (
+                not isinstance(current_candidate, dict)
+                or current_candidate.get("schema") != "publication-candidate-v2"
+                or current_candidate.get("source") not in {"same-lease-commit", "adopted-existing-commit"}
+                or current_candidate.get("commit_head") != expected_head
+            ):
+                raise RuntimeError("Publication candidate was invalidated before push.")
+            candidate = current_candidate
+            if candidate.get("expected_origin_main") != expected_origin_main or candidate.get("parent_head") != expected_origin_main:
+                raise RuntimeError("Publication candidate remote binding changed before push.")
+            if candidate.get("tree_sha") != commit_tree_sha(expected_head):
+                raise RuntimeError("Publication candidate tree identity changed before push.")
+            if candidate.get("source") == "adopted-existing-commit":
+                require_adoption_validation(current_lease)
+            if candidate.get("candidate_worktree_fingerprint") is not None and candidate.get("candidate_worktree_fingerprint") != worktree_fingerprint():
+                raise RuntimeError("Worktree changed after publication candidate creation.")
+            if candidate.get("candidate_index_fingerprint") is not None and candidate.get("candidate_index_fingerprint") != index_fingerprint():
+                raise RuntimeError("Index changed after publication candidate creation.")
             run_git("fetch", "origin", mutating=True, timeout=120)
             ensure_git_mutation_preconditions(expected_head)
-            actual_origin = resolve_ref("origin/main")
+            actual_origin = resolve_ref(publication_tracking_ref())
             if actual_origin != expected_origin_main:
                 raise RuntimeError(f"Remote main changed. Expected={expected_origin_main}, actual={actual_origin}")
-            counts = run_git("rev-list", "--left-right", "--count", "main...origin/main").split()
+            counts = run_git("rev-list", "--left-right", "--count", f"{publication_branch()}...{publication_tracking_ref()}").split()
             ahead, behind = (int(counts[0]), int(counts[1])) if len(counts) == 2 else (None, None)
             if behind not in {0, None}:
                 raise RuntimeError("origin/main is ahead/diverged; normal push refused.")
-            if resolve_ref("HEAD") != resolve_ref("main"):
+            if resolve_ref("HEAD") != resolve_ref(publication_branch()):
                 raise RuntimeError("HEAD must equal local main for push.")
-            run_git("push", "origin", "main:main", mutating=True, timeout=180)
+            run_git("push", "origin", f"{publication_branch()}:{publication_branch()}", mutating=True, timeout=180)
             run_git("fetch", "origin", mutating=True, timeout=120)
             local_head = resolve_ref("HEAD")
-            local_main = resolve_ref("main")
-            remote_main = resolve_ref("origin/main")
+            local_main = resolve_ref(publication_branch())
+            remote_main = resolve_ref(publication_tracking_ref())
             if not (local_head == local_main == remote_main == expected_head):
                 raise RuntimeError("Post-push convergence failed: HEAD, main and origin/main are not identical.")
         if worktree_fingerprint() != before_fingerprint:
@@ -6105,11 +7564,12 @@ def git_push(
             "dry_run": False,
             "lease_id": lease_id,
             "head": expected_head,
-            "main": resolve_ref("main"),
-            "origin_main": resolve_ref("origin/main"),
+            "main": resolve_ref(publication_branch()),
+            "origin_main": resolve_ref(publication_tracking_ref()),
             "remote_identity": identity,
             "verified": True,
             "post_push_converged": True,
+            "publication_candidate_source": candidate.get("source"),
             "validation_run_id": candidate.get("validation_run_id"),
         })
     except Exception as exc:
@@ -6282,6 +7742,7 @@ def start_validation(
         starting_head = require_expected_head(expected_head)
         state = {
             "run_id": run_id,
+        "project": PROJECT_ID,
             "operation_id": operation_id,
             "lease_id": lease_id,
             "execution_id": lease.get("execution_id"),
@@ -6290,6 +7751,8 @@ def start_validation(
             "selectors": selectors,
             "private_context": resolved_context,
             "private_context_configured": resolved_context is not None,
+            "source_provenance": ({k:v for k,v in (gmail_attachment(resolved_context) or {}).items()
+                                   if k in {"gmail_message_id","gmail_attachment_id","sha256"}} if resolved_context else None),
             "validation_intent": resolved_intent,
             "provenance_label": normalize_provenance_label(provenance_label) or lease.get("provenance_label"),
             "private_result_contract": private_result_contract,
@@ -6347,6 +7810,7 @@ def validation_result(run_id: UUIDString, detail: ValidationResultDetail = "summ
     state = read_state(run_id)
     result = {
         "run_id": run_id,
+        "project": PROJECT_ID,
         "lease_id": state.get("lease_id"),
         "execution_id": state.get("execution_id"),
         "status": state.get("status"),
@@ -6402,6 +7866,7 @@ def validation_wait_result(
     if state.get("status") == "running":
         return enforce_structured_output({
             "run_id": run_id,
+        "project": PROJECT_ID,
             "status": "running",
             "result_ready": False,
             "retry_safe": True,
@@ -6462,6 +7927,7 @@ def cancel_validation(run_id: UUIDString, operation_id: UUIDString, lease_id: UU
                 pass
         return finish_operation(operation_id, {
             "run_id": run_id,
+        "project": PROJECT_ID,
             "lease_id": lease_id,
             "cancel_requested": True,
             "terminated": terminated,
@@ -6556,7 +8022,7 @@ def documentation_sync_preflight(max_bytes: ToolOutputBytes = 120_000) -> dict[s
     result = {
         "head": resolve_ref("HEAD"),
         "branch": run_git("branch", "--show-current") or None,
-        "origin_main_local_record": resolve_ref("origin/main"),
+        "origin_main_local_record": resolve_ref(publication_tracking_ref()),
         "documents": docs,
         "roadmap_candidates": roadmap_hits,
         "changed_production_and_test_paths": changed_tracked_paths(),
@@ -6578,6 +8044,7 @@ def cycle_close_evidence(run_ids: list[UUIDString] | None = None, max_bytes: Too
         state = read_state(run_id)
         runs.append({
             "run_id": run_id,
+        "project": PROJECT_ID,
             "operation": state.get("operation"),
             "status": state.get("status"),
             "exit_code": state.get("exit_code"),
@@ -6974,17 +8441,16 @@ _MAINTENANCE_COMPONENT_FILES = {
     "static_qualifier": "qualify_executor_current_static.py",
     "isolated_qualifier": "qualify_executor_current_isolated.py",
     "release_qualifier": "qualify_release.py",
-    "main_launcher": "LedgerForge MCP.command",
+    "main_launcher": "mcp_control.py",
     "owner_admin": "ledgerforge_mcp_owner_admin.py",
-    "owner_wrapper": "LedgerForge MCP Owner Recovery.command",
     "owner_version": ".mcp-owner-recovery-version",
     "release_activator": "ledgerforge_mcp_release_activator.py",
     "release_version": ".mcp-release-version",
 }
-_MAINTENANCE_EXECUTABLE_ROLES = {"executor", "static_qualifier", "isolated_qualifier", "release_qualifier", "main_launcher", "owner_admin", "owner_wrapper", "release_activator"}
+_MAINTENANCE_EXECUTABLE_ROLES = {"executor", "static_qualifier", "isolated_qualifier", "release_qualifier", "main_launcher", "owner_admin", "release_activator"}
 _MAINTENANCE_REQUIRED_ARM_ROLES = {
     "executor", "static_qualifier", "isolated_qualifier", "release_qualifier",
-    "main_launcher", "owner_admin", "owner_wrapper", "owner_version",
+    "main_launcher", "owner_admin", "owner_version",
     "release_activator", "release_version",
 }
 
@@ -6992,7 +8458,7 @@ _MAINTENANCE_REQUIRED_ARM_ROLES = {
 def _maintenance_control_targets() -> dict[str, Path]:
     return {
         "executor_source": BRIDGE_ROOT / "executor_v2_1.py",
-        "main_launcher": MAINTENANCE_DESKTOP / "LedgerForge MCP.command",
+        "main_launcher": MAINTENANCE_DESKTOP / "mcp_control.py",
         "owner_admin": BRIDGE_ROOT / "ledgerforge_mcp_owner_admin.py",
         "owner_wrapper": MAINTENANCE_DESKTOP / "LedgerForge MCP Owner Recovery.command",
         "owner_version": BRIDGE_ROOT / ".mcp-owner-recovery-version",
@@ -7399,7 +8865,7 @@ def _maintenance_running_operation_receipts() -> list[str]:
     return sorted(rows)
 
 
-def _maintenance_quiescence() -> dict[str, Any]:
+def _single_project_quiescence() -> dict[str, Any]:
     lease = public_lease_view(read_active_lease_raw())
     active_validation, _ = _validation_state_rows()
     local_processes = [row for row in _public_local_process_rows() if row.get("status") == "running"]
@@ -7416,6 +8882,20 @@ def _maintenance_quiescence() -> dict[str, Any]:
         "running_operation_receipts": running_ops,
     }
 
+
+def _maintenance_quiescence():
+    status = _single_project_quiescence()
+    if INSTANCE_PROJECT is None:
+        for path in sorted((PRODUCTION_STATE / "projects").glob("*/identity.json")):
+            try:
+                ctx = project_engine(json.loads(path.read_text())["project"])
+                other = ctx._single_project_quiescence()
+            except Exception:
+                other = {"safe": False}
+            if not other.get("safe"):
+                status["safe"] = False
+                status.setdefault("projects_requiring_recovery", []).append(path.parent.name)
+    return status
 
 @tool(read_only=True)
 def maintenance_status(max_bytes: ToolOutputBytes = 120_000) -> dict[str, Any]:

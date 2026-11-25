@@ -1,44 +1,21 @@
-# LedgerForge MCP root
+# Installed MCP control plane
 
-Current accepted release: **2.6.2**
+The native application is installed at **/Users/vyom/Applications/ChatGPT MCP.app**. The authorized recursive workspace is **/Users/vyom/Applications/ChatGPT**. Its **LedgerForge-MCP** child contains the readable executor, the environment, release qualification and owner recovery. The bundle records the relative route to its controller. The app can remain in the menu bar across ordinary window closes and can start silently at login.
 
-Primary record:
-`2.6.2/RELEASE_RECORD.md`
+## Runtime and routing
 
-Current manifest:
-`2.6.2/MANIFEST.sha256`
+The existing **.executor-v2.1-state-root** pointer selects the preserved production state directory relative to the infrastructure repository. LedgerForge keeps its historical execution records. Other projects bind state to their exact workspace-relative identity under its projects directory. Every project-scoped request selects its own context. A project picker in the native window only changes the local inspector.
 
-Organization:
-- `2.6.2/` current accepted release
-- `2.6.1/` accepted rollback baseline
-- `previous/` rollback/legacy material
-- `archive/` historical development and audit material
+Normal and administrative tunnel profiles remain **ledgerforge-recovery** and **ledgerforge-recovery-admin**. The controller verifies exact process and listener identities before signaling a service. The user edits local ports in Settings. A backend port change updates both upstream mappings. Changing a profile health port affects that profile. A failed port change has a recoverable transaction under the private maintenance directory.
 
-Hidden `.executor-*`, `.mcp-maintenance` and `.venv` paths are operational runtime exceptions and must not be reorganized casually.
+## Operations and recovery
 
-Never use the LedgerForge product repository as MCP artifact storage.
+Open **Maintenance & Recovery** for service controls, connection diagnostics, execution leases, owned processes, qualification results, verified rollback copies and cleanup. Recovery uses the existing owner helper, its exclusive lock, exact lease matching, quiescence checks, state backup and audit. Recover stale lease and Force-release lease both rediscover the selected record before executing. An owner can choose whether to restart the Shared Tunnel afterward.
 
-## Finder presentation
+Prepared releases, qualification results, arming state and deployment receipts live in **.mcp-maintenance**. The activator checks the complete component manifest, identities and current deployment, takes a rollback backup, replaces the components, verifies live probes and records the result. A selectable rollback copy must match its active deployment receipt, recorded targets and all required backup digests. Other historical receipts remain inspectable.
 
-Finder-facing policy for the MCP root:
+Recoverable data includes the current state tree, scratch work whose closure is uncertain, audit records and required activation backups. Machine-local paths in old signed-off operational receipts describe their original installation. Current code derives paths from the active installation and workspace.
 
-- Visible: `2.6.1/`, `archive/`, `previous/`, `MCP_ROOT_RECORD.md`.
-- Installed runtime files remain at their established root paths but carry the macOS Finder `hidden` flag.
-- Historical compatibility symlinks remain at their established root paths but carry the macOS Finder `hidden` flag.
-- Hidden flags are presentation metadata only. They do not change pathnames, file contents, symlink targets, hashes, runtime behavior, or historical receipt resolution.
-- Do not move or delete hidden compatibility/runtime entries merely because Finder normally suppresses them.
+## Private validation
 
-
-## Canonical physical checkout
-
-As of 2026-08-25:
-
-- Canonical physical MCP root:
-  `/Users/vyom/Applications/LedgerForge-MCP`
-- Historical compatibility path:
-  `/Users/vyom/ledgerforge-mcp-prototype`
-- The historical path is a symlink to the canonical physical root.
-- Keep the compatibility path throughout the 2.6.2 lifecycle because the accepted launcher, state pointers and historical receipts reference it.
-- Do not rewrite historical deployment receipts merely to replace the old pathname.
-- LedgerForge product repository remains physically separate at:
-  `/Users/vyom/Applications/LedgerForge`
+Original attachments obtained from Gmail supply financial-source evidence on demand. The optional transient handoff records message ID, attachment ID, content digest and the selected file outside the repository. Financial material, statement storage, credentials, service output and durable machine state stay outside Git.

@@ -1,33 +1,26 @@
-# LedgerForge MCP Executor
+# ChatGPT MCP
 
-Local MCP execution and evidence infrastructure for LedgerForge.
+ChatGPT MCP connects ChatGPT to the owner's local development workspace. Open **ChatGPT MCP.app** in the user's Applications folder or choose **Open ChatGPT MCP** from its menu bar icon. Its background login item can be managed in Settings.
 
-## Current production baseline
+## Installation and operation
 
-- Executor: 2.6.2
-- Toolset revision: 9
-- Schema contract revision: 2.6.2
-- Snapshot contract: execution-snapshot-v2
+The default workspace is the **ChatGPT** folder in the user's Applications directory. The infrastructure repository is its **LedgerForge-MCP** child. The native app derives its controller location from the installed bundle. The executor, Python environment, recovery state and release components resolve from the installation. Service configuration and credentials remain on this Mac.
 
-Canonical release evidence is under `2.6.2/`. The accepted 2.6.1 package remains
-under `2.6.1/` as the verified rollback baseline.
+The Overview checks the running implementation, source, Python environment, state, local authenticated MCP calls and independent connection listeners. A running system offers Stop and Restart. A stopped system offers Start. A partial failure identifies the affected component. Settings contains login, appearance, refresh, log and port preferences. Settings also exposes the installed executor capability preferences. Activity & Logs displays service log lines as recorded on this Mac.
 
-This repository contains the MCP control-plane runtime, qualification harnesses,
-release transport and deployment evidence. It does not contain LedgerForge
-product source or product data. Release staging uses immutable, hash-verified
-blob chunks with resumable cross-chat assembly; callers never provide arbitrary
-filesystem paths to the maintenance API.
+Maintenance & Recovery discovers project, lease, process, validation, release, rollback and cleanup records. Select a record to inspect it and see its available actions. Local owner recovery remains available when the remote connections are down. Qualifying, arming and activating a release are distinct operations. Activation and rollback recheck quiescence and verify the restarted backend.
 
-## Active MCP tool surface — Executor 2.6.2
+The Shared Tunnel is the local executor backend. MCP Executor and MCP Admin are separate registered tunnel-client profiles. Their default ports are 8768, 8080 and 8081 respectively. Applying a port change updates the exact profile mappings, restarts affected running services and verifies the result. Preserve the authentication files, tunnel registrations and configured Git remote.
 
-This is the human-readable catalogue for the **55 active registered tools** in
-Toolset Revision 9. The callable names are mechanically checked against
-`TOOL_ANNOTATION_CONTRACT` in `executor_v2_1.py`; the live schema remains the
-runtime authority for argument shapes.
+## Project selection
 
-`Normal` means the ordinary authenticated executor surface. `Admin-only` means
-the tool requires the separate `ledgerforge:admin` scope. Admin sessions may
-also invoke normal tools.
+Call **workspace_projects** to discover identifiers. Pass an exact workspace-relative **project** on each project-scoped tool call. For example, **Logbook/public-info** selects the nested repository, while **Logbook** selects its parent. A top-level non-Git folder supports filesystem and scratch work. Git and publication tools require a Git repository. The workspace evidence root permits bounded recursive inspection. Repository changes use the selected project’s own lease, working tree, effect verification and publication evidence. The running MCP installation uses its qualified local maintenance path.
+
+LedgerForge-specific Xcode and private validation are scoped to LedgerForge. When private source evidence is required, supply the original attachment retrieved from its source Gmail message to the existing transient handoff. Missing attachment evidence makes that validation unavailable. Infrastructure readiness has no financial archive dependency.
+
+## Active MCP tools
+
+Executor 3.0.0 exposes 57 registered tools in toolset revision 11. The normal connection supports development work. The Admin credential adds bounded deployment and maintenance authority. The live schema is authoritative for argument types and bounds.
 
 <!-- ACTIVE_TOOL_CATALOGUE_START -->
 
@@ -36,11 +29,12 @@ also invoke normal tools.
 | `executor_capabilities` | Return live executor capability/version information without secret values. | Normal | Read-only | No | Mechanical capability evidence only; it grants no project authorization. |
 | `executor_help` | Return a concise usage FAQ for new or resumed Executor chats. | Normal | Read-only | No | Guidance only; it does not authorize mutation. |
 | `host_status` | Return bounded non-secret executor and tunnel host health. | Normal | Read-only | No | Reports health/identity without exposing credential values. |
-| `workspace_state` | Return complete local LedgerForge Git/worktree safety state. | Normal | Read-only | No | Product repository only; no implicit fetch. |
+| `workspace_projects` | Discover workspace-relative project identifiers, including nested Git repositories. | Normal | Read-only | No | Each project-scoped call includes its own project identifier. |
+| `workspace_state` | Return complete selected project Git/worktree safety state. | Normal | Read-only | No | Selected repository only; no implicit fetch. |
 | `execution_lease_status` | Return writer-lease lifecycle and owned-resource evidence without the capability token. | Normal | Read-only | No | Status is evidence, not mutation authority. |
 | `executor_recovery_status` | Return startup recovery, journal, and process evidence without mutation. | Normal | Read-only | No | Recovery evidence only; performs no cleanup. |
 | `execution_snapshot` | Return a read-only mechanical continuation snapshot. | Normal | Read-only | No | Snapshot carries no project authorization. |
-| `acquire_execution_lease` | Acquire the single LedgerForge mutable execution lease and return its opaque token once. | Normal | Control mutation | Creates lease | Product-repository mutation still requires exact bound state and separate authorization. |
+| `acquire_execution_lease` | Acquire the selected project’s mutable execution lease and return its opaque token once. | Normal | Control mutation | Creates lease | Product-repository mutation still requires exact bound state and separate authorization. |
 | `resume_execution_lease` | Resume an existing owned execution lease against exact repository state. | Normal | Control mutation | Existing lease | Fails closed on identity/state mismatch. |
 | `heartbeat_execution_lease` | Refresh an owned execution lease without persisting its token. | Normal | Control mutation | Yes | Refreshes only the exact owned lease. |
 | `release_execution_lease` | Release the writer lease without repository rollback or cleanup. | Normal | Control mutation | Yes | Does not undo repository changes. |
@@ -50,8 +44,8 @@ also invoke normal tools.
 | `artifact_inspect` | Inspect supported artifacts with bounded/private-safe handling. | Normal | Read-only | No | Supports only registered artifact kinds and roots. |
 | `git_inspect` | Inspect bounded Git state, diffs, log, show, or blame without mutation or fetch. | Normal | Read-only | No | Local Git evidence only; remote freshness requires an explicit fetch. |
 | `local_fs_inspect` | Inspect registered local roots with binary-safe bounded reads. | Normal | Read-only | No | No arbitrary caller paths; credentials remain blocked. |
-| `local_fs_mutate` | Apply a reviewed binary-safe mutation batch to the product repo or an owned task workspace. | Normal | Mutation | Repo: yes; scratch: no | Only `repo` and `task_scratch` roots are mutable; repo changes require exact lease/state. |
-| `task_workspace` | Create, inspect, clean up, or safely close one MCP-owned task workspace. | Normal | Mutation | No | Scratch only, outside the LedgerForge product repository. |
+| `local_fs_mutate` | Apply a reviewed binary-safe mutation batch to the selected repo or an owned task workspace. | Normal | Mutation | Repo: yes; scratch: no | Only `repo` and `task_scratch` roots are mutable; repo changes require exact lease/state. |
+| `task_workspace` | Create, inspect, clean up, or safely close one MCP-owned task workspace. | Normal | Mutation | No | Scratch only, outside the selected repository. |
 | `process_start` | Start one reviewed bounded argv process in an MCP task workspace. | Normal | Mutation | Repo-writing process: yes | Network denied; repository writes are effect-bounded and exclude `.git`. |
 | `process_status` | Return durable local-process state without output bodies. | Normal | Read-only | No | Exact executor-owned run only. |
 | `process_wait` | Wait boundedly for a durable local process without cancelling it. | Normal | Read-only | No | Waits only; never cancels. |
@@ -63,6 +57,7 @@ also invoke normal tools.
 | `git_stage` | Stage only explicitly named paths after successful lease-bound validation. | Normal | Mutation | Yes | Exact HEAD/worktree/index binding. |
 | `precommit_privacy_scan` | Scan exact staged blobs for prohibited private/residue classes. | Normal | Read-only | No | Privacy/residue check only; not financial-correctness authority. |
 | `git_commit` | Commit exactly the validated staged index on `main`. | Normal | Mutation | Yes | Requires exact staged-path/index binding and privacy scan boundary. |
+| `adopt_publication_candidate` | Adopt an existing validated fast-forward commit for a fresh lease after an interruption. | Normal | Recovery mutation | Yes | Fresh origin fetch, exact HEAD/worktree/index/validation binding, commit-diff privacy scan; never stages, rewrites, or pushes. |
 | `git_push` | Push the lease-bound validated commit to `origin/main` and prove convergence. | Normal | Network mutation | Yes | No force push or history rewriting. |
 | `run_repo_task` | Run one fixed server-registered repository task. | Normal | Controlled execution | Execution: yes | Only registered tasks; no arbitrary shell. |
 | `start_validation` | Start one bounded build/test/cycle-close validation. | Normal | Controlled execution | Yes | Bound to exact HEAD and active execution lease. |
@@ -90,22 +85,8 @@ also invoke normal tools.
 | `maintenance_release` | Stage, qualify, inspect, arm, or discard immutable prepared MCP releases. | Admin-only | Mutation | No product lease | Admin scope required; never activates a release and exposes no generic admin shell. |
 <!-- ACTIVE_TOOL_CATALOGUE_END -->
 
-The table records operational intent, not project authorization. A lease is a
-mechanical capability and never substitutes for Chat-approved scope. Tools that
-can mutate the LedgerForge product repository continue to require their exact
-lease/state preconditions. MCP maintenance tools do not provide an arbitrary
-admin shell or arbitrary filesystem access.
+## Build and qualification
 
-## Repository boundary
+Run **script/build_and_run.sh** to build, sign and install the native app. Its normal local control path uses the installed system Python and remains available for owner recovery when the executor environment is unavailable. Run the repository regression suite with the installed virtual environment and Python unittest discovery. The isolated HTTP qualifier exercises actual project routing and a disposable Git remote. The prepared-release qualifier verifies the staged controls and transaction recovery. Keep private state, credentials, service logs and prepared artifacts outside Git.
 
-This repository is separate from the LedgerForge product repository.
-
-- LedgerForge product: `/Users/vyom/Applications/LedgerForge`
-- LedgerForge MCP: `/Users/vyom/Applications/LedgerForge-MCP`
-
-MCP runtime state, credentials, task workspaces, rollback stores,
-historical build artifacts and private material are intentionally not
-version-controlled.
-
-See `MCP_ROOT_RECORD.md`, `2.6.2/RELEASE_RECORD.md` and the historical
-`2.6.1/RELEASE_RECORD.md`.
+See **MCP_ROOT_RECORD.md** for the deployment layout and recovery details.
