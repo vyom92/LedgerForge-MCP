@@ -12,6 +12,10 @@ Maintenance & Recovery discovers project, lease, process, validation, release, r
 
 The Shared Tunnel is the local executor backend. MCP Executor and MCP Admin are separate registered tunnel-client profiles. Their default ports are 8768, 8080 and 8081 respectively. Applying a port change updates the exact profile mappings, restarts affected running services and verifies the result. Preserve the authentication files, tunnel registrations and configured Git remote.
 
+## Refresh tools in ChatGPT
+
+After a release changes tool names or inputs, open the existing **MCP Executor** and **MCP Admin** connections in ChatGPT Plugins and refresh their tool definitions. Review the changes in workspace app settings if your account manages approved actions there. In a new chat, call **workspace_projects**, then read the chosen project with **workspace_state**. The native Verify schema action checks the running Mac service. ChatGPT stores its own approved tool definitions. [OpenAI connection refresh instructions](https://developers.openai.com/plugins/deploy/connect-chatgpt#refresh-metadata).
+
 ## Project selection
 
 Call **workspace_projects** to discover identifiers. Pass an exact workspace-relative **project** on each project-scoped tool call. For example, **Logbook/public-info** selects the nested repository, while **Logbook** selects its parent. A top-level non-Git folder supports filesystem and scratch work. Git and publication tools require a Git repository. The workspace evidence root permits bounded recursive inspection. Repository changes use the selected project’s own lease, working tree, effect verification and publication evidence. The running MCP installation uses its qualified local maintenance path.
